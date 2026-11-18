@@ -2,7 +2,7 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js'
 import type { Contract, Fn, Model, NamedItem, Span, StateVar, Stmt, StmtKind } from './model'
-import { driveCar, highway, streets, withOverpasses, type Highway } from './city'
+import { cityGate, driveCar, highway, streets, withOverpasses, type Highway, type SegKind } from './city'
 import { castle, glassStorey, glassTower, goldDome, mast, observationDeck, plantRoom, roofGarden, storey, temple, trafficCone, warehouse, type Frame, type Make, type Roof } from './architecture'
 
 // ---------------------------------------------------------------------------
@@ -50,6 +50,9 @@ const PLINTH_H = 0.3
 const FOUND_H = 0.1 // foundation slab of storage / temple / mast / cone lots
 const LOT = 2.85 // a tower's foundation: the full width of its lot
 const MAX_LOT_CELLS = 3 // widest a storage lot is drawn, however many slots its variable spans
+/** gates along a city's front edge: kept this far from the corners, and this far apart (a two-way road is 2.7 wide) */
+const GATE_MARGIN = 2.2
+const GATE_PITCH = 4
 /** how far a storey's facade is set back per level of nesting (if / for / unchecked …) */
 const NEST_RECESS = 0.12
 
@@ -119,8 +122,12 @@ interface City {
   col: number
   x1: number
   x2: number
-  /** z of the city's front edge */
+  /** z of the city's back (north) and front (south) edges */
+  back: number
   edge: number
+  /** the street behind the storage row, and the streets across the city (avenue … front street) */
+  backStreet: number
+  rowStreets: number[]
   frontStreet: number
   /** world x of the vertical streets: where highways may enter */
   cols: number[]
@@ -337,7 +344,9 @@ export class Scene3D {
   }
 
   /** One contract = one city. `left` is where the city's ground starts on the x axis. */
-  private buildContract(c: Contract, left: number): { group: THREE.Group; width: number; back: number; edge: number; frontStreet: number; cols: number[] } {
+  private buildContract(c: Contract, left: number, minWidth = 0): {
+    group: THREE.Group; width: number; back: number; edge: number; frontStreet: number; backStreet: number; rowStreets: number[]; cols: number[]
+  } {
     const ox = left + 1.4 // local x = -1.4 is the city's left edge
     const g = new THREE.Group()
     g.position.set(ox, 0, 0)
@@ -463,9 +472,11 @@ export class Scene3D {
     }
 
     // ---- plate ----
-    const x1 = -1.4, x2 = Math.max(maxX, 6) + 1.4
+    // the front edge is widened when needed so that every road gets a gate of its own
+    const x1 = -1.4, x2 = Math.max(Math.max(maxX, 6) + 1.4, x1 + minWidth)
     const zA = -CD / 2 - 1.3, zB = maxZ + 1.0
-    streets(g, { cols: colStreets, rows: rowStreets, x1, x2, y: PLATE_Y })
+    const backStreet = -CD / 2 - 0.6 // behind the storage row, for gates on the north edge
+    streets(g, { cols: colStreets, rows: rowStreets, back: backStreet, x1, x2, y: PLATE_Y })
     const kindColor = c.kind === 'interface' ? '#141a2b' : c.kind === 'library' ? '#10221c' : c.kind === 'abstract' ? '#1a1630' : '#141827'
     const plate = this.mesh(unitBox, kindColor, { roughness: 0.9 })
     plate.scale.set(x2 - x1, PLATE_Y, zB - zA)
@@ -482,7 +493,7 @@ export class Scene3D {
     const kindTag = c.kind === 'contract' ? '' : `<span class="tag">${c.kind}</span>`
     this.label(g, `${c.name}${kindTag}`, 'lbl contract', new THREE.Vector3(x1 + 0.3, PLATE_Y, zA), c.id, true, [0, 1])
     this.focusTargets.set(c.id, new THREE.Vector3(ox + (x1 + x2) / 2, 0, (zA + zB) / 2))
-    return { group: g, width: x2 - x1, back: zA, edge: zB, frontStreet, cols: colStreets.map((cx) => ox + cx) }
+    return { group: g, width: x2 - x1, back: zA, edge: zB, frontStreet, backStreet, rowStreets, cols: colStreets.map((cx) => ox + cx) }
   }
 
   /**
@@ -536,43 +547,125 @@ export class Scene3D {
     const cols = Math.max(1, Math.min(n, Math.round(Math.sqrt(n * aspect * 1.6))))
     const rows = Math.ceil(n / cols)
 
+    const rels0 = this.relations(model)
+
+    // Gates sit on all four sides: north and south edges (on the back street and the front street)
+    // and east and west ends of the streets across the city. A city's front and back edges are wide
+    // enough that, between them, every road can have its own gate.
+    const roadEnds = new Map<string, number>()
+    for (const r of rels0) for (const x of [r.from, r.to]) roadEnds.set(x, (roadEnds.get(x) ?? 0) + 1)
+    const gateSpan = (k: number) => (k > 1 ? 2 * GATE_MARGIN + (k - 1) * GATE_PITCH : 0)
+
     // build every city at the origin first, to know its size
     const built = order.map((c, i) => {
       const row = Math.floor(i / cols)
       const col = row % 2 === 0 ? i % cols : cols - 1 - (i % cols) // snake: neighbours in `order` stay adjacent
-      return { c, row, col, b: this.buildContract(c, 0) }
+      // north and south edges alone can give every road a gate; east/west gates are extra room, so a
+      // road end that finds no clean gate on its side always has somewhere else to go
+      return { c, row, col, b: this.buildContract(c, 0, gateSpan(Math.ceil((roadEnds.get(c.name) ?? 0) / 2))) }
     })
+    type Built = (typeof built)[number]
     const cell = new Map(built.map((x) => [x.c.name, x]))
 
-    // pass 1: which corridors each road uses, and its lane in each
-    // lane pitch: a road crossing the next lane needs half a road + a ramp + a straight run before
-    // its corner, so it is back on the ground before it turns
-    const TRACK = 6.5
-    const LANE0 = 5.6 // first lane this far below a row: room for a ramp up to the first overpass
-    const hLanes = new Array(rows + 1).fill(0), vLanes = new Array(cols + 1).fill(0)
-    const rels = this.relations(model)
-      .map((r) => {
-        const A = cell.get(r.from)!, B = cell.get(r.to)!
-        return { r, A, B, dist: Math.abs(A.row - B.row) + Math.abs(A.col - B.col) }
-      })
-      .sort((a, b) => a.dist - b.dist)
-    const routes = rels.map(({ r, A, B }) => {
-      const hA = A.row + 1, laneA = hLanes[hA]++
-      if (A.row === B.row) return { r, A, B, hA, laneA }
-      // vertical corridor that keeps the detour shortest
-      const cand = [A.col, A.col + 1, B.col, B.col + 1]
-      const v = cand.reduce((best, k) => {
-        const cost = (k: number) => Math.abs(k - (A.col + 0.5)) + Math.abs(k - (B.col + 0.5))
-        return cost(k) < cost(best) ? k : best
-      })
-      const laneV = vLanes[v]++
-      const hB = B.row + 1, laneB = hLanes[hB]++
-      return { r, A, B, hA, laneA, v, laneV, hB, laneB }
+    type Side = 'S' | 'N' | 'E' | 'W'
+    type Corr = { axis: 'H' | 'V'; index: number }
+    // The layout is computed, checked, and only then applied. When a road end cannot get a clean gate
+    // on the side it was planned for (every gate there would put its stub alongside another road's),
+    // that side is ruled out for that road end and the roads are planned again.
+    const attempt = (forbid: Set<string>) => {
+    const conflicts: string[] = []
+    // ---- pass 1: for each road, the side it leaves and enters by, and the corridors it travels ----
+    const slotCount = (width: number) => {
+      const span = width - 2 * GATE_MARGIN
+      return span > 0 ? Math.floor(span / GATE_PITCH + 1e-6) + 1 : 1
+    }
+    // east/west gates sit on the streets across the city; the back street is too close to the north edge
+    // for a road's width (half of a two-way road is 1.35, the back street is 0.7 inside the edge)
+    const capacity = (x: Built, side: Side) => (side === 'S' || side === 'N' ? slotCount(x.b.width) : x.b.rowStreets.length)
+    const used = new Map<string, Record<Side, number>>()
+    const usedOf = (name: string) => {
+      let u = used.get(name)
+      if (!u) used.set(name, (u = { S: 0, N: 0, E: 0, W: 0 }))
+      return u
+    }
+    // S → corridor below the row, N → above it, E → right of the column, W → left of it
+    const corridorOf = (x: Built, side: Side): Corr =>
+      side === 'S' ? { axis: 'H', index: x.row + 1 } : side === 'N' ? { axis: 'H', index: x.row }
+        : side === 'E' ? { axis: 'V', index: x.col + 1 } : { axis: 'V', index: x.col }
+    const between = (a: number, b: number) => [a, a + 1, b, b + 1].reduce((best, k) => {
+      const cost = (k: number) => Math.abs(k - (a + 0.5)) + Math.abs(k - (b + 0.5))
+      return cost(k) < cost(best) ? k : best
     })
+    const lanes = { H: new Array<number>(rows + 1).fill(0), V: new Array<number>(cols + 1).fill(0) }
+    const plansIn = rels0
+      .map((r) => ({ r, A: cell.get(r.from)!, B: cell.get(r.to)! }))
+      .sort((p, q) => (Math.abs(p.A.row - p.B.row) + Math.abs(p.A.col - p.B.col)) - (Math.abs(q.A.row - q.B.row) + Math.abs(q.A.col - q.B.col)))
+      .map(({ r, A, B }) => {
+        const dx = B.col - A.col, dy = B.row - A.row
+        // sides of A that face B, and sides of B that face A
+        const aV: Side[] = dy > 0 ? ['S'] : dy < 0 ? ['N'] : ['S', 'N']
+        const aH: Side[] = dx > 0 ? ['E'] : dx < 0 ? ['W'] : ['E', 'W']
+        const bV: Side[] = dy > 0 ? ['N'] : dy < 0 ? ['S'] : ['S', 'N']
+        const bH: Side[] = dx > 0 ? ['W'] : dx < 0 ? ['E'] : ['E', 'W']
+        const pairs: [Side, Side][] = []
+        const add = (as: Side[], bs: Side[]) => { for (const a of as) for (const b of bs) pairs.push([a, b]) }
+        if (Math.abs(dx) >= Math.abs(dy)) { add(aH, bH); add(aV, bH); add(aH, bV); add(aV, bV) }
+        else { add(aV, bV); add(aH, bV); add(aV, bH); add(aH, bH) }
+        const legsFor = (sa: Side, sb: Side): Corr[] => {
+          const ca = corridorOf(A, sa), cb = corridorOf(B, sb)
+          if (ca.axis !== cb.axis) return [ca, cb] // an L: along one corridor, then the crossing one
+          if (ca.index === cb.index) return [ca] // both gates open onto the same corridor
+          const mid: Corr = ca.axis === 'H' ? { axis: 'V', index: between(A.col, B.col) } : { axis: 'H', index: between(A.row, B.row) }
+          return [ca, mid, cb]
+        }
+        // fewest turns wins, among sides that still have a free gate
+        let best: { sa: Side; sb: Side; legs: Corr[]; score: number } | undefined
+        pairs.forEach(([sa, sb], i) => {
+          const legs = legsFor(sa, sb)
+          const fits = usedOf(r.from)[sa] < capacity(A, sa) && usedOf(r.to)[sb] < capacity(B, sb)
+          const banned = forbid.has(`${r.key}:A:${sa}`) || forbid.has(`${r.key}:B:${sb}`)
+          const score = (banned ? 1e5 : 0) + (fits ? 0 : 1000) + legs.length * 10 + i * 0.01
+          if (!best || score < best.score) best = { sa, sb, legs, score }
+        })
+        usedOf(r.from)[best!.sa]++
+        usedOf(r.to)[best!.sb]++
+        return { r, A, B, sa: best!.sa, sb: best!.sb, legs: best!.legs.map((l) => ({ ...l, lane: lanes[l.axis][l.index]++ })) }
+      })
 
-    // pass 2: corridor and cell sizes → positions
-    const hW = hLanes.map((k, i) => (i === 0 ? 3 : Math.max(8.5, LANE0 + Math.max(k - 1, 0) * TRACK + 3.2)))
-    const vW = vLanes.map((k) => Math.max(6, 4.4 + Math.max(k - 1, 0) * TRACK))
+    // Lane order inside each corridor: a road whose gate stub comes in from the west (or north) side
+    // takes a lane on that side, one coming in from the east (or south) a lane on the far side, and
+    // roads that only pass through (or have stubs on both sides) the lanes in between. Stubs then reach
+    // their lanes without running across, and alongside, each other.
+    const users = new Map<string, { plan: number; leg: number }[]>()
+    plansIn.forEach((p, i) => p.legs.forEach((l, j) => {
+      const k = `${l.axis}${l.index}`
+      users.set(k, [...(users.get(k) ?? []), { plan: i, leg: j }])
+    }))
+    const fromSide = (ref: { plan: number; leg: number }) => {
+      const p = plansIn[ref.plan], l = p.legs[ref.leg]
+      let low = false, high = false
+      const note = (side: Side) => {
+        if (l.axis === 'V') { if (side === 'E') low = true; else if (side === 'W') high = true }
+        else { if (side === 'S') low = true; else if (side === 'N') high = true }
+      }
+      if (ref.leg === 0) note(p.sa) // A's stub comes into this corridor
+      if (ref.leg === p.legs.length - 1) note(p.sb) // B's stub leaves from it
+      return low && !high ? 0 : high && !low ? 2 : 1
+    }
+    for (const refs of users.values()) {
+      refs.sort((a, b) => fromSide(a) - fromSide(b) || a.plan - b.plan)
+      refs.forEach((ref, idx) => { plansIn[ref.plan].legs[ref.leg].lane = idx })
+    }
+
+    // ---- pass 2: corridor and cell sizes → positions ----
+    // lane pitch: a road crossing the next lane needs half a road + a ramp + a straight run before
+    // its corner, so it is back on the ground before it turns; the margin leaves room for a ramp
+    // between a city's gate and the first lane, on either side of a corridor
+    const TRACK = 6.5
+    const MARGIN = 5.6
+    const corridorWidth = (k: number, outer: boolean) => (k > 0 ? 2 * MARGIN + (k - 1) * TRACK : outer ? 3 : 6)
+    const hW = lanes.H.map((k, i) => corridorWidth(k, i === 0 || i === rows))
+    const vW = lanes.V.map((k, j) => corridorWidth(k, j === 0 || j === cols))
     const colW = new Array(cols).fill(0), rowD = new Array(rows).fill(0)
     for (const x of built) {
       colW[x.col] = Math.max(colW[x.col], x.b.width)
@@ -593,60 +686,199 @@ export class Scene3D {
       if (i < rows) { rowTop[i] = zc; zc += rowD[i] }
     }
 
-    // move each city into its cell (centred in its column, front edge on the corridor)
+    // where each city goes (centred in its column, front edge on the corridor); applied once settled
     const cities = new Map<string, City>()
-    const owner = (id: string) => id.split(':')[1]
+    const offsets = new Map<string, { dx: number; dz: number }>()
     for (const x of built) {
       const dx = colLeft[x.col] + (colW[x.col] - x.b.width) / 2
       const dz = rowTop[x.row] + rowD[x.row] - x.b.edge
+      offsets.set(x.c.name, { dx, dz })
+      const info: City = {
+        row: x.row, col: x.col, x1: dx, x2: dx + x.b.width, back: x.b.back + dz, edge: x.b.edge + dz,
+        backStreet: x.b.backStreet + dz, rowStreets: x.b.rowStreets.map((z) => z + dz), frontStreet: x.b.frontStreet + dz,
+        cols: x.b.cols.map((c) => c + dx), contract: x.c,
+      }
+      cities.set(x.c.name, info)
+    }
+
+    // ---- pass 3: gates and routes ----
+    // north/south gates: evenly spaced along the edge, kept clear of the corners;
+    // east/west gates: at the ends of the streets across the city (avenue, between rows, front street)
+    const slots = new Map([...cities].map(([k, C]) => {
+      const lo = C.x1 + GATE_MARGIN, hi = C.x2 - GATE_MARGIN
+      const n = slotCount(C.x2 - C.x1)
+      const xs = n === 1 ? [(C.x1 + C.x2) / 2] : Array.from({ length: n }, (_, i) => lo + ((hi - lo) * i) / (n - 1))
+      const zs = [...C.rowStreets]
+      return [k, { S: [...xs], N: [...xs], E: [...zs], W: [...zs] } as Record<Side, number[]>]
+    }))
+    // stubs already laid in each corridor (from gates on either side of it), so that a new stub never
+    // runs alongside another one too closely: gates of the cities above and below a corridor (or left
+    // and right of it) are chosen independently and could otherwise line up
+    const stubs = new Map<string, { at: number; lo: number; hi: number; half: number }[]>()
+    /** the free gate on a side nearest to where the road heads next, whose stub keeps clear of others */
+    // gates in use on each side, and how many each side still has to give (planned in pass 1)
+    const taken = new Map<string, number[]>()
+    const left = new Map([...used].map(([k, u]) => [k, { ...u }]))
+    const isNS = (side: Side) => side === 'S' || side === 'N'
+    /** can a gate go at `v` on this side: on the edge (north/south) or a street end (east/west), spaced
+     *  from the side's other gates, its stub clear of other stubs, and leaving enough gates for later roads */
+    const fits = (city: string, side: Side, v: number, corridor: string, span: [number, number], half: number) => {
+      const C = cities.get(city)!
+      const list = slots.get(city)![side]
+      const inUse = taken.get(`${city}:${side}`) ?? []
+      if (isNS(side)) {
+        if (v < C.x1 + GATE_MARGIN - 1e-6 || v > C.x2 - GATE_MARGIN + 1e-6) return false
+        if (inUse.some((u) => Math.abs(u - v) < GATE_PITCH - 1e-6)) return false
+        const blocked = list.filter((x) => Math.abs(x - v) < GATE_PITCH - 1e-6).length
+        const onSlot = list.some((x) => Math.abs(x - v) < 0.05)
+        if (!onSlot && list.length - blocked < (left.get(city)?.[side] ?? 1) - 1) return false
+      } else {
+        if (!list.some((z) => Math.abs(z - v) < 0.05)) return false
+        // the road's mouth must lie wholly on the city's side, clear of its corners
+        if (v - C.back < half + 0.2 || C.edge - v < half + 0.2) return false
+      }
+      const lo = Math.min(...span), hi = Math.max(...span)
+      return (stubs.get(corridor) ?? []).every((o) => Math.abs(o.at - v) >= o.half + half + 1 || Math.min(o.hi, hi) - Math.max(o.lo, lo) <= 0.1)
+    }
+    const commit = (city: string, side: Side, v: number, corridor: string, span: [number, number], half: number) => {
+      const list = slots.get(city)![side]
+      const gap = isNS(side) ? GATE_PITCH - 1e-6 : 0.05
+      for (let i = list.length - 1; i >= 0; i--) if (Math.abs(list[i] - v) < gap) list.splice(i, 1)
+      taken.set(`${city}:${side}`, [...(taken.get(`${city}:${side}`) ?? []), v])
+      const l = left.get(city)
+      if (l) l[side] = Math.max(0, l[side] - 1)
+      stubs.set(corridor, [...(stubs.get(corridor) ?? []), { at: v, lo: Math.min(...span), hi: Math.max(...span), half }])
+      return v
+    }
+    /**
+     * Pick a gate on one side: the free slot nearest to where the road heads (`toward`). On north and
+     * south edges the gate may also sit exactly opposite `toward`. With `jogs`, a sideways jog shorter
+     * than two bends (which reads as a kink) is avoided: the jog is either zero or at least `minJog`.
+     */
+    const take = (city: string, side: Side, toward: number, corridor: string, span: [number, number], half: number, jogs: boolean, tag: string) => {
+      const C = cities.get(city)!
+      const list = slots.get(city)![side]
+      const minJog = 2 * (half + 1) + 0.5
+      const cands = [...list]
+      if (isNS(side)) cands.push(toward)
+      const ok = cands.filter((v) => fits(city, side, v, corridor, span, half))
+      if (!ok.length) conflicts.push(tag) // no clean gate on this side: plan this road end differently
+      const pool = ok.length ? ok : list
+      if (!pool.length) return isNS(side) ? (C.x1 + C.x2) / 2 : C.frontStreet
+      const score = (v: number) => {
+        const d = Math.abs(v - toward)
+        return d < 0.05 ? 0 : jogs && d < minJog ? 1000 + d : d
+      }
+      const best = pool.reduce((b, v) => (score(v) < score(b) ? v : b))
+      return commit(city, side, Math.abs(best - toward) < 0.05 ? toward : best, corridor, span, half)
+    }
+    /** For a road that only crosses one corridor: one position that suits both gates, so it runs straight. */
+    const shared = (p: (typeof plansIn)[number], half: number, corridor: string, spanA: [number, number], spanB: [number, number]) => {
+      const A = cities.get(p.r.from)!, B = cities.get(p.r.to)!
+      let cands: number[]
+      if (isNS(p.sa)) {
+        const lo = Math.max(A.x1, B.x1) + GATE_MARGIN, hi = Math.min(A.x2, B.x2) - GATE_MARGIN
+        if (hi < lo - 1e-6) return undefined
+        const mid = (lo + hi) / 2
+        cands = []
+        for (let d = 0; d <= (hi - lo) / 2 + 1e-6; d += 0.5) cands.push(mid - d, mid + d)
+        cands = cands.filter((v) => v >= lo - 1e-6 && v <= hi + 1e-6)
+      } else {
+        // east/west gates sit on street ends: only streets both cities have at the same height
+        cands = slots.get(p.r.from)![p.sa].filter((z) => slots.get(p.r.to)![p.sb].some((w) => Math.abs(w - z) < 0.05))
+        cands.sort((a, b) => b - a) // front streets first: they line up across a row
+      }
+      return cands.find((v) => fits(p.r.from, p.sa, v, corridor, spanA, half) && fits(p.r.to, p.sb, v, corridor, spanB, half))
+    }
+    /** where a gate's stub starts: just past the ramp off the city, on the corridor side */
+    const outAt = (C: City, side: Side) => (side === 'S' ? C.edge + 1.2 : side === 'N' ? C.back - 1.2 : side === 'E' ? C.x2 + 1.2 : C.x1 - 1.2)
+    const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z)
+    const y0 = 0.01, yc = PLATE_Y
+    /** inside the city on its street, on the edge, and out on the ground past the ramp */
+    const gatePoints = (C: City, side: Side, at: number) =>
+      side === 'S' ? [V(at, yc, C.frontStreet), V(at, yc, C.edge), V(at, y0, C.edge + 1.2)]
+        : side === 'N' ? [V(at, yc, C.backStreet), V(at, yc, C.back), V(at, y0, C.back - 1.2)]
+          : side === 'E' ? [V(C.x2 - 0.6, yc, at), V(C.x2, yc, at), V(C.x2 + 1.2, y0, at)]
+            : [V(C.x1 + 0.6, yc, at), V(C.x1, yc, at), V(C.x1 - 1.2, y0, at)]
+    const laneAt = (l: Corr & { lane: number }) => (l.axis === 'H' ? hTop[l.index] : vLeft[l.index]) + MARGIN + l.lane * TRACK
+    const centre = (C: City, axis: 'x' | 'z') => (axis === 'x' ? (C.x1 + C.x2) / 2 : C.frontStreet)
+
+    const plans: { r: Rel; path: THREE.Vector3[]; kinds: SegKind[]; half: number; gates: [THREE.Vector3[], THREE.Vector3[]] }[] = []
+    for (const p of plansIn) {
+      const A = cities.get(p.r.from)!, B = cities.get(p.r.to)!
+      const last = p.legs[p.legs.length - 1]
+      const half = p.r.kind === 'oneway' ? 0.8 : 1.35
+      const key = (l: Corr) => `${l.axis}${l.index}`
+      // A's gate: nearest to where the first corridor leg turns (or to B when there is one leg)
+      const aToward = p.legs.length > 1 ? laneAt(p.legs[1]) : centre(B, isNS(p.sa) ? 'x' : 'z')
+      const spanA: [number, number] = [outAt(A, p.sa), laneAt(p.legs[0])]
+      const spanB: [number, number] = [laneAt(last), outAt(B, p.sb)]
+      // a road that only crosses one corridor gets gates facing each other when there is room for it
+      const straight = p.legs.length === 1 ? shared(p, half, key(last), spanA, spanB) : undefined
+      let aAt: number, bAt: number
+      if (straight !== undefined) {
+        aAt = commit(p.r.from, p.sa, straight, key(p.legs[0]), spanA, half)
+        bAt = commit(p.r.to, p.sb, straight, key(last), spanB, half)
+      } else {
+        aAt = take(p.r.from, p.sa, aToward, key(p.legs[0]), spanA, half, p.legs.length > 1, `${p.r.key}:A:${p.sa}`)
+        // B's gate: nearest to where the last leg arrives from
+        const bToward = p.legs.length > 1 ? laneAt(p.legs[p.legs.length - 2]) : aAt
+        bAt = take(p.r.to, p.sb, bToward, key(last), spanB, half, true, `${p.r.key}:B:${p.sb}`)
+      }
+      const ga = gatePoints(A, p.sa, aAt), gb = gatePoints(B, p.sb, bAt)
+
+      const path: THREE.Vector3[] = []
+      const kinds: SegKind[] = []
+      const push = (pt: THREE.Vector3, kind?: SegKind) => {
+        if (path.length && pt.distanceTo(path[path.length - 1]) < 0.01) return
+        if (path.length) kinds.push(kind!)
+        path.push(pt)
+      }
+      // the highway meets each city at its outer edge (the city's street carries on inside)
+      push(ga[1]); push(ga[2], 'ramp')
+      let cur = ga[2]
+      p.legs.forEach((l, i) => {
+        // onto this leg's lane: the gate's stub for the first leg, travel along the previous one after
+        const c = laneAt(l)
+        cur = l.axis === 'H' ? V(cur.x, y0, c) : V(c, y0, cur.z)
+        push(cur, i === 0 ? 'stub' : p.legs[i - 1].axis === 'H' ? 'h' : 'v')
+      })
+      // along the last lane to B's gate, then in
+      cur = last.axis === 'H' ? V(gb[2].x, y0, cur.z) : V(cur.x, y0, gb[2].z)
+      push(cur, last.axis === 'H' ? 'h' : 'v')
+      push(gb[2], 'stub'); push(gb[1], 'ramp')
+      plans.push({ r: p.r, path, kinds, half, gates: [ga, gb] })
+    }
+    return { cities, offsets, plans, conflicts, y0 }
+    }
+
+    // plan, check, and re-plan the road ends that found no clean gate (a few rounds at most)
+    const forbid = new Set<string>()
+    let layout = attempt(forbid)
+    for (let round = 0; round < 8 && layout.conflicts.length; round++) {
+      const before = forbid.size
+      layout.conflicts.forEach((c) => forbid.add(c))
+      if (forbid.size === before) break // nothing new to rule out
+      layout = attempt(forbid)
+    }
+
+    // apply: move the cities into place, then lay the roads
+    const owner = (id: string) => id.split(':')[1]
+    for (const x of built) {
+      const { dx, dz } = layout.offsets.get(x.c.name)!
       x.b.group.position.x += dx
       x.b.group.position.z += dz
       for (const m of [this.anchors, this.focusTargets]) for (const [id, p] of m) if (owner(id) === x.c.name) { p.x += dx; p.z += dz }
-      cities.set(x.c.name, {
-        row: x.row, col: x.col, x1: dx, x2: dx + x.b.width, edge: x.b.edge + dz, frontStreet: x.b.frontStreet + dz,
-        cols: x.b.cols.map((c) => c + dx), contract: x.c,
-      })
     }
-
-    // pass 3: geometry. Gates are slots along the city's front edge, kept well inside its rim
-    // (a two-way road is 2.7 wide); each road takes the free slot nearest the side it heads to.
-    const free = new Map([...cities].map(([k, C]) => {
-      const lo = C.x1 + 2.2, hi = C.x2 - 2.2
-      const n = hi > lo ? Math.floor((hi - lo) / 3.4) + 1 : 1
-      const slots = n === 1 ? [(C.x1 + C.x2) / 2] : Array.from({ length: n }, (_, i) => lo + ((hi - lo) * i) / (n - 1))
-      return [k, slots]
-    }))
-    const gate = (city: string, towardX: number) => {
-      const C = cities.get(city)!
-      const slots = free.get(city)!
-      if (!slots.length) return (C.x1 + C.x2) / 2
-      const right = towardX > (C.x1 + C.x2) / 2
-      return (right ? slots.pop() : slots.shift())!
+    for (const p of layout.plans) {
+      const [ga, gb] = p.gates
+      cityGate(this.root, ga[0], ga[1])
+      cityGate(this.root, gb[0], gb[1])
     }
-    const laneZ = (h: number, lane: number) => hTop[h] + LANE0 + lane * TRACK
-    const laneX = (v: number, lane: number) => vLeft[v] + 2.2 + lane * TRACK
-    const V = (x: number, y: number, z: number) => new THREE.Vector3(x, y, z)
-    const y0 = 0.01, yc = PLATE_Y
-    const plans: { r: Rel; path: THREE.Vector3[]; half: number }[] = []
-    for (const rt of routes) {
-      const A = cities.get(rt.r.from)!, B = cities.get(rt.r.to)!
-      const xv = rt.v !== undefined ? laneX(rt.v, rt.laneV!) : undefined
-      const xa = gate(rt.r.from, xv ?? (B.x1 + B.x2) / 2)
-      const xb = gate(rt.r.to, xv ?? (A.x1 + A.x2) / 2)
-      const za = laneZ(rt.hA, rt.laneA)
-      const path = [V(xa, yc, A.frontStreet), V(xa, yc, A.edge), V(xa, y0, A.edge + 1.2), V(xa, y0, za)]
-      if (xv === undefined) path.push(V(xb, y0, za))
-      else {
-        const zb = laneZ(rt.hB!, rt.laneB!)
-        path.push(V(xv, y0, za), V(xv, y0, zb), V(xb, y0, zb))
-      }
-      path.push(V(xb, y0, B.edge + 1.2), V(xb, yc, B.edge), V(xb, yc, B.frontStreet))
-      plans.push({ r: rt.r, path: path.filter((p, i) => i === 0 || p.distanceTo(path[i - 1]) > 0.01), half: rt.r.kind === 'oneway' ? 0.8 : 1.35 })
-    }
-    // where roads cross, the north–south one becomes an overpass
-    withOverpasses(plans, y0).forEach((path, i) => {
-      this.roadPaths.set(plans[i].r.key, path)
-      this.addHighway(plans[i].r, path)
+    // where roads cross, one becomes an overpass (gate stubs over through lanes, north–south over east–west)
+    withOverpasses(layout.plans, layout.y0).forEach((path, i) => {
+      this.roadPaths.set(layout.plans[i].r.key, path)
+      this.addHighway(layout.plans[i].r, path)
     })
   }
 

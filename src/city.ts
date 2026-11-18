@@ -43,6 +43,8 @@ export interface CityGrid {
   cols: number[]
   /** z of the horizontal streets (local): avenue behind the towers, between rows, front street */
   rows: number[]
+  /** z of the street behind the storage row (no cross streets reach it) */
+  back?: number
   x1: number
   x2: number
   y: number
@@ -56,6 +58,11 @@ export function streets(parent: THREE.Object3D, g: CityGrid) {
   for (const z of g.rows) {
     const a = new THREE.Vector3(g.x1 + 0.5, y, z), b = new THREE.Vector3(g.x2 - 0.5, y, z)
     strip(parent, a, b, 1.1, 0.01, asphalt)
+    dashes(parent, a.clone().setY(y + 0.01), b.clone().setY(y + 0.01), paint, 0.06, 0.5, 0.5)
+  }
+  if (g.back !== undefined) {
+    const a = new THREE.Vector3(g.x1 + 0.5, y, g.back), b = new THREE.Vector3(g.x2 - 0.5, y, g.back)
+    strip(parent, a, b, 0.9, 0.01, asphalt)
     dashes(parent, a.clone().setY(y + 0.01), b.clone().setY(y + 0.01), paint, 0.06, 0.5, 0.5)
   }
   for (const x of g.cols) {
@@ -75,6 +82,20 @@ export function streets(parent: THREE.Object3D, g: CityGrid) {
     b.position.set(x + 0.55, g.y + 1.33, z + 0.6)
     parent.add(p, b)
   }
+}
+
+/**
+ * Where a highway meets a city: the city's own street runs on to the outer edge, where the highway
+ * starts, so the highway itself never lies on the city's ground.
+ */
+export function cityGate(parent: THREE.Object3D, inner: THREE.Vector3, edge: THREE.Vector3) {
+  const asphalt = mat('#0b0e17')
+  const paint = mat('#3b4260', { emissive: '#1a1e2e' })
+  const y = inner.y + 0.002
+  // reach a little into the street it joins, but stop exactly at the edge: nothing hangs past the land
+  const inward = inner.clone().sub(edge).setY(0).normalize()
+  strip(parent, inner.clone().addScaledVector(inward, 0.55).setY(y), edge.clone().setY(y), 1.1, 0.01, asphalt)
+  if (inner.distanceTo(edge) > 0.9) dashes(parent, inner.clone().setY(y + 0.01), edge.clone().setY(y + 0.01), paint, 0.06, 0.5, 0.5)
 }
 
 // ---------------------------------------------------------------------------
@@ -300,35 +321,20 @@ export function highway(path: THREE.Vector3[], kind: 'oneway' | 'twoway', traffi
     for (let i = 0; i < n; i++) cars.push(spawn(group, lane(0), i, n))
   }
 
-  // overpass furniture: guard rails, posts and pillars
+  // overpass furniture: guard rails and their posts (the deck needs no pillars)
   const railMat = mat('#a3adc2', { metalness: 0.5, roughness: 0.35, side: DS })
   for (const side of [-1, 1]) band(group, S, side * (width / 2 + 0.06), 0.07, 0.3, railMat, { depth: () => 0.07, keep: raised })
-  const pillarMat = mat('#3c4357')
-  const pillarGeo = new THREE.CylinderGeometry(0.11, 0.14, 1, 8)
-  let nextPost = 0, nextPillar = 0
+  let nextPost = 0
   for (let i = 0; i < S.length - 1; i++) {
     const { p, n, s } = S[i]
-    if (!raised(i)) continue
-    if (s >= nextPost) {
-      for (const side of [-1, 1]) {
-        const post = new THREE.Mesh(box, railMat)
-        post.scale.set(0.05, 0.26, 0.05)
-        post.position.copy(p).addScaledVector(n, side * (width / 2 + 0.06)).setY(p.y + 0.16)
-        group.add(post)
-      }
-      nextPost = s + 0.9
+    if (!raised(i) || s < nextPost) continue
+    for (const side of [-1, 1]) {
+      const post = new THREE.Mesh(box, railMat)
+      post.scale.set(0.05, 0.26, 0.05)
+      post.position.copy(p).addScaledVector(n, side * (width / 2 + 0.06)).setY(p.y + 0.16)
+      group.add(post)
     }
-    if (s >= nextPillar && p.y > ground + 0.6) {
-      for (const side of width > 2 ? [-1, 1] : [0]) {
-        const h = p.y - 0.3
-        const m = new THREE.Mesh(pillarGeo, pillarMat)
-        m.scale.set(1, h, 1)
-        m.position.copy(p).addScaledVector(n, side * (width / 2 - 0.4)).setY(h / 2)
-        m.castShadow = true
-        group.add(m)
-      }
-      nextPillar = s + 2.2
-    }
+    nextPost = s + 0.9
   }
 
   // label over the middle of the longest straight leg of the route
@@ -369,11 +375,17 @@ const RAMP = 2.4
 /** level road kept between a ramp and a corner (≥ that road's corner radius, half width + 1) */
 const cornerClear = (half: number) => half + 1.05
 
+/** what a stretch of a road is: inside a city, the ramp off it, a gate's stub to its lane, or travel along a lane */
+export type SegKind = 'city' | 'ramp' | 'stub' | 'v' | 'h'
+/** who climbs over whom where two roads cross: gate stubs first, then north–south lanes, then east–west */
+const LIFT_PRIORITY: Record<SegKind, number> = { stub: 3, v: 2, h: 1, ramp: 0, city: 0 }
+
 /**
- * Where a north–south stretch of one road crosses an east–west stretch of another, the north–south
- * road climbs a ramp, crosses on a bridge and comes back down. Crossings close together share one bridge.
+ * Where two roads cross at ground level, one of them climbs a ramp, crosses on a bridge and comes
+ * back down: the one with the higher priority (ties: the north–south one). Crossings close together
+ * share one bridge, and ramps stay clear of corners so a road is level again before it turns.
  */
-export function withOverpasses(roads: { path: THREE.Vector3[]; half: number }[], ground: number): THREE.Vector3[][] {
+export function withOverpasses(roads: { path: THREE.Vector3[]; kinds: SegKind[]; half: number }[], ground: number): THREE.Vector3[][] {
   const onGround = (p: THREE.Vector3) => Math.abs(p.y - ground) < 0.02
   const turns = (p: THREE.Vector3[], i: number) => {
     if (i <= 0 || i >= p.length - 1) return false
@@ -381,36 +393,50 @@ export function withOverpasses(roads: { path: THREE.Vector3[]; half: number }[],
     const v = new THREE.Vector3(p[i + 1].x - p[i].x, 0, p[i + 1].z - p[i].z).normalize()
     return u.dot(v) < 0.999
   }
+  type Seg = { road: number; k: number; a: THREE.Vector3; b: THREE.Vector3; ns: boolean; pri: number }
+  const segs: Seg[] = []
+  roads.forEach((r, i) => {
+    for (let k = 0; k < r.path.length - 1; k++) {
+      const a = r.path[k], b = r.path[k + 1]
+      if (!onGround(a) || !onGround(b)) continue
+      const ns = Math.abs(a.x - b.x) < 0.01 && Math.abs(a.z - b.z) > 0.01
+      const ew = Math.abs(a.z - b.z) < 0.01 && Math.abs(a.x - b.x) > 0.01
+      if (ns || ew) segs.push({ road: i, k, a, b, ns, pri: LIFT_PRIORITY[r.kinds[k]] ?? 0 })
+    }
+  })
+  // crossings: which segment lifts, and where along it
+  const lifts = new Map<string, { s: number; half: number }[]>()
+  for (let i = 0; i < segs.length; i++) for (let j = i + 1; j < segs.length; j++) {
+    const s1 = segs[i], s2 = segs[j]
+    if (s1.road === s2.road || s1.ns === s2.ns) continue
+    const ns = s1.ns ? s1 : s2, ew = s1.ns ? s2 : s1
+    const inX = ns.a.x > Math.min(ew.a.x, ew.b.x) + 0.01 && ns.a.x < Math.max(ew.a.x, ew.b.x) - 0.01
+    const inZ = ew.a.z > Math.min(ns.a.z, ns.b.z) + 0.01 && ew.a.z < Math.max(ns.a.z, ns.b.z) - 0.01
+    if (!inX || !inZ) continue
+    const up = ew.pri > ns.pri ? ew : ns
+    const under = up === ns ? ew : ns
+    const along = up.ns ? Math.abs(ew.a.z - up.a.z) : Math.abs(ns.a.x - up.a.x)
+    const key = `${up.road}:${up.k}`
+    lifts.set(key, [...(lifts.get(key) ?? []), { s: along, half: roads[under.road].half }])
+  }
   return roads.map((r, i) => {
     const out = [r.path[0].clone()]
     for (let k = 0; k < r.path.length - 1; k++) {
       const a = r.path[k], b = r.path[k + 1]
+      const hits = lifts.get(`${i}:${k}`)
+      if (!hits) { out.push(b.clone()); continue }
       const startClear = turns(r.path, k) ? cornerClear(r.half) : 0.05
       const endClear = turns(r.path, k + 1) ? cornerClear(r.half) : 0.05
-      const ns = onGround(a) && onGround(b) && Math.abs(a.x - b.x) < 0.01 && Math.abs(a.z - b.z) > 0.01
-      const hits: { z: number; half: number }[] = []
-      if (ns) roads.forEach((o, j) => {
-        if (j === i) return
-        for (let m = 0; m < o.path.length - 1; m++) {
-          const c = o.path[m], d = o.path[m + 1]
-          if (!onGround(c) || !onGround(d) || Math.abs(c.z - d.z) > 0.01) continue
-          const inX = a.x > Math.min(c.x, d.x) + 0.01 && a.x < Math.max(c.x, d.x) - 0.01
-          const inZ = c.z > Math.min(a.z, b.z) + 0.01 && c.z < Math.max(a.z, b.z) - 0.01
-          if (inX && inZ) hits.push({ z: c.z, half: o.half })
-        }
-      })
-      if (!hits.length) { out.push(b.clone()); continue }
-      const len = Math.abs(b.z - a.z), dir = Math.sign(b.z - a.z)
-      const tops = hits
-        .map((h) => { const s = (h.z - a.z) * dir; return [s - h.half - 0.35, s + h.half + 0.35] })
-        .sort((p, q) => p[0] - q[0])
+      const len = Math.hypot(b.x - a.x, b.z - a.z)
+      const dir = new THREE.Vector3(b.x - a.x, 0, b.z - a.z).normalize()
+      const tops = hits.map((h) => [h.s - h.half - 0.35, h.s + h.half + 0.35]).sort((p, q) => p[0] - q[0])
       const merged: number[][] = []
       for (const t of tops) {
         const last = merged[merged.length - 1]
         if (last && t[0] - last[1] < RAMP * 2) last[1] = Math.max(last[1], t[1])
         else merged.push([...t])
       }
-      const at = (s: number, y: number) => new THREE.Vector3(a.x, y, a.z + dir * s)
+      const at = (s: number, y: number) => a.clone().addScaledVector(dir, s).setY(y)
       for (const [t0, t1] of merged) {
         const r0 = Math.max(startClear, t0 - RAMP), r1 = Math.min(len - endClear, t1 + RAMP)
         out.push(at(r0, ground), at(Math.max(t0, r0 + 0.3), ground + BRIDGE_H), at(Math.min(t1, r1 - 0.3), ground + BRIDGE_H), at(r1, ground))

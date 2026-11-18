@@ -33,11 +33,18 @@ Cities are joined by **highways**:
   `IERC20(x).approve()`, `new Foo()`); more call sites = more traffic.
 
 Cities sit on a 2D grid (columns chosen from the pane's shape, snake order so connected cities stay
-neighbours). Roads leave each city through its south gate and run along the corridors between cities;
-every road gets its own lane, and corridors widen with the number of roads using them. Where two
-roads cross, the north–south one climbs onto an overpass (deck, pillars, guard rails) and comes back down.
-Every building stands on a foundation that fills its whole lot. A road lights
-up and its traffic speeds up when the code under the cursor crosses into the other city.
+neighbours), with corridors between them. Gates are on all four sides of a city: north and south edges
+(on the back street behind the storage row and on the front street) and east and west ends of the
+avenue, the streets between rows and the front street (never the back street, which runs too close to
+the north edge for a road's width). Each road leaves by the side facing the other city, with the fewest
+turns, and gets its own gate and its own lane in every corridor. A city's north and south edges are
+always wide enough to give every road a gate between them, so when a road end finds no clean gate on
+the side it was planned for, the roads are planned again with that side ruled out. A highway meets a
+city exactly at its outer edge, and the city's street carries on inside; no part of a road lies
+outside the land it serves. Where two roads cross, one climbs onto an overpass (deck and guard rails,
+no pillars): gate stubs over through lanes, north–south over east–west. Every building stands on a
+foundation that fills its whole lot. A road lights up and its traffic speeds up when the code under
+the cursor crosses into the other city.
 
 Links (shown for whatever the cursor is on): **cyan** = reads storage, **orange** = writes storage,
 **violet** = internal call, **yellow** = call into another contract, **pink** = emit, **red** = revert
