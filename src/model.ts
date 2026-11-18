@@ -110,10 +110,28 @@ export interface Contract {
   enums: NamedItem[]
   /** other contracts of this file that this one calls, with the number of call sites */
   callsOut: { target: string; count: number; first: Span }[]
+  /** where it is deployed, for code read from the chain (`// @contract Name 0x…`) */
+  address?: string
+  /** deployed there, but its source is not verified (an empty city) */
+  unverified?: boolean
+}
+
+/** A road read from the chain: an address one contract holds, or the implementation a proxy runs. */
+export interface OnchainLink {
+  from: string
+  to: string
+  /** the getter, variable or constant that holds the address ('implementation' for a proxy) */
+  via: string
+  kind: 'ref' | 'proxy'
+  /** where `via` is declared in `from`, else the annotation line */
+  span: Span
 }
 
 export interface Model {
   contracts: Contract[]
+  /** roads read from the chain (`// @link` and `// @proxy` lines written by an address import) */
+  links: OnchainLink[]
+  chain?: { id: number; name: string }
 }
 
 export interface ParseResult {
@@ -139,10 +157,56 @@ export function analyze(source: string): ParseResult {
     const contracts = ast.children
       .filter((c): c is AST.ContractDefinition => c.type === 'ContractDefinition')
       .map((c) => ctx.contract(c))
-    return { model: { contracts }, errors }
+    return { model: { contracts, ...readOnchain(lines, contracts) }, errors }
   } catch (e) {
     return { errors: [...errors, { line: 0, column: 0, message: `Could not analyse this code: ${(e as Error).message}` }] }
   }
+}
+
+/** The `// @chain`, `// @contract`, `// @proxy` and `// @link` lines an import from the chain writes. */
+function readOnchain(lines: string[], contracts: Contract[]): { links: OnchainLink[]; chain?: { id: number; name: string } } {
+  const links: OnchainLink[] = []
+  let chain: { id: number; name: string } | undefined
+  const byName = new Map(contracts.map((c) => [c.name, c]))
+  /** the declaration of `via` in `holder` or what it inherits: a state variable, else a function */
+  const declared = (holder: string, via: string): Span | undefined => {
+    const name = via.replace(/\[\d+\]$/, '')
+    const seen = new Set<string>()
+    const look = (cn: string): Span | undefined => {
+      const c = byName.get(cn)
+      if (!c || seen.has(cn)) return undefined
+      seen.add(cn)
+      const found = c.vars.find((v) => v.name === name)?.span ?? c.fns.find((f) => f.name === name)?.span
+      if (found) return found
+      for (const b of c.bases) {
+        const s = look(b)
+        if (s) return s
+      }
+      return undefined
+    }
+    return look(holder)
+  }
+  let offset = 0
+  lines.forEach((text, i) => {
+    const start = offset
+    offset += text.length + 1
+    if (!text.startsWith('// @')) return
+    const span: Span = { startLine: i + 1, endLine: i + 1, start, end: start + text.length }
+    let m: RegExpExecArray | null
+    if ((m = /^\/\/ @chain (\d+) (.+)$/.exec(text))) chain = { id: Number(m[1]), name: m[2].trim() }
+    else if ((m = /^\/\/ @contract (\w+) (0x[0-9a-fA-F]{40})( unverified)?\s*$/.exec(text))) {
+      const c = byName.get(m[1])
+      if (c) {
+        c.address = m[2]
+        if (m[3]) c.unverified = true
+      }
+    } else if ((m = /^\/\/ @proxy (\w+) -> (\w+)\s*$/.exec(text))) {
+      links.push({ from: m[1], to: m[2], via: 'implementation', kind: 'proxy', span })
+    } else if ((m = /^\/\/ @link (\w+)\.(\w+(?:\[\d+\])?) -> (\w+)\s*$/.exec(text))) {
+      links.push({ from: m[1], via: m[2], to: m[3], kind: 'ref', span: declared(m[1], m[2]) ?? span })
+    }
+  })
+  return { links, chain }
 }
 
 const ELEMENTARY_BYTES: Record<string, number> = { bool: 1, address: 20, byte: 1 }

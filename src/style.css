@@ -81,6 +81,14 @@ main { flex: 1; min-height: 0; display: grid; grid-template-columns: var(--split
 .lbl.road.twoway .arrow { color: #facc15; }
 .lbl.road.active { background: #3b2f86; border-color: #c4b5fd; box-shadow: 0 0 0 3px #8b6cff55; }
 .lbl.road.twoway.active { background: #4a3a0c; border-color: #facc15; box-shadow: 0 0 0 3px #facc1544; }
+/* roads read from the chain: an address a contract holds, a proxy's implementation */
+.lbl.road.chain { border-color: #34d399; background: #0f2a22e6; }
+.lbl.road.chain .arrow { color: #34d399; }
+.lbl.road.chain.active { background: #0f4a36; border-color: #6ee7b7; box-shadow: 0 0 0 3px #34d39944; }
+.lbl.road.proxy { border-color: #38bdf8; background: #0c2233e6; }
+.lbl.road.proxy .arrow { color: #38bdf8; }
+.lbl.road.proxy.active { background: #0c3a55; border-color: #7dd3fc; box-shadow: 0 0 0 3px #38bdf844; }
+.lbl.contract .tag.addr { font: 400 10.5px ui-monospace, Menlo, monospace; color: #a7f3d0; }
 
 /* editor decorations driven from the 3D view */
 .hover-range { background: #8b6cff1f; }
@@ -94,16 +102,16 @@ main { flex: 1; min-height: 0; display: grid; grid-template-columns: var(--split
 }
 
 /* GitHub import dialog */
-#gh { width: min(640px, calc(100vw - 32px)); max-height: min(80vh, 720px); padding: 0; border: 1px solid #2b3150; border-radius: 12px; background: var(--panel); color: var(--text); box-shadow: 0 20px 60px #000a; }
-#gh::backdrop { background: #05060acc; }
-#gh form { display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; max-height: min(80vh, 720px); box-sizing: border-box; }
-#gh h3 { margin: 0; font-size: 15px; }
-#gh .muted { margin: 0; color: var(--muted); font-size: 12px; }
-#gh code { font-size: 11px; background: #161a28; padding: 1px 4px; border-radius: 4px; }
+:is(#gh, #addr) { width: min(640px, calc(100vw - 32px)); max-height: min(80vh, 720px); padding: 0; border: 1px solid #2b3150; border-radius: 12px; background: var(--panel); color: var(--text); box-shadow: 0 20px 60px #000a; }
+:is(#gh, #addr)::backdrop { background: #05060acc; }
+:is(#gh, #addr) form { display: flex; flex-direction: column; gap: 10px; padding: 16px 18px; max-height: min(80vh, 720px); box-sizing: border-box; }
+:is(#gh, #addr) h3 { margin: 0; font-size: 15px; }
+:is(#gh, #addr) .muted { margin: 0; color: var(--muted); font-size: 12px; }
+:is(#gh, #addr) code { font-size: 11px; background: #161a28; padding: 1px 4px; border-radius: 4px; }
 .gh-row { display: flex; gap: 8px; }
-#gh input[type=text], #gh input:not([type]) { flex: 1; min-width: 0; background: #090b12; color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font: 12px ui-monospace, Menlo, monospace; }
-#gh input:focus { outline: none; border-color: var(--accent); }
-#gh label.check { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }
+:is(#gh, #addr) :is(input[type=text], input[type=password], input:not([type])) { flex: 1; min-width: 0; background: #090b12; color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font: 12px ui-monospace, Menlo, monospace; }
+:is(#gh, #addr) input:focus { outline: none; border-color: var(--accent); }
+:is(#gh, #addr) label.check { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }
 .gh-status { font-size: 12px; color: var(--muted); min-height: 16px; white-space: pre-wrap; }
 .gh-status.err { color: var(--err); }
 #gh-files { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; min-height: 0; border: 1px solid var(--line); border-radius: 8px; }
@@ -113,3 +121,16 @@ main { flex: 1; min-height: 0; display: grid; grid-template-columns: var(--split
 #gh-files li .dir { color: var(--muted); }
 #gh-files li .tag { margin-left: auto; color: #5b647e; font-size: 10.5px; }
 .gh-foot { display: flex; justify-content: flex-end; }
+
+/* import from an address */
+#addr select { background: #090b12; color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 7px 8px; font: 12px ui-sans-serif, system-ui, sans-serif; }
+.addr-opts { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; color: var(--muted); font-size: 12px; }
+.addr-opts label { display: flex; gap: 6px; align-items: center; }
+.addr-more { color: var(--muted); font-size: 12px; }
+.addr-more summary { cursor: pointer; }
+.addr-more[open] { display: flex; flex-direction: column; gap: 6px; }
+#addr-log { list-style: none; margin: 0; padding: 6px 10px; overflow-y: auto; flex: 1; min-height: 0; max-height: 240px; border: 1px solid var(--line); border-radius: 8px; font: 11.5px/1.55 ui-monospace, Menlo, monospace; color: var(--muted); }
+#addr-log:empty { display: none; }
+#addr-log li.ok { color: #a7f3d0; }
+#addr-log li.warn { color: #fbbf24; }
+

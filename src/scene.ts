@@ -40,6 +40,8 @@ const PLINTH_COLORS: Record<string, string> = {
 }
 const LINK_COLORS = { read: '#22d3ee', write: '#fb923c', call: '#c084fc', emit: '#f9a8d4', modifier: '#fb7185', ext: '#facc15', revert: '#ef4444' }
 const ROAD_ACCENT = { oneway: '#a78bfa', twoway: '#e2e8f0' }
+/** roads read from the chain: an address a contract holds (also its centre line), a proxy's implementation */
+const CHAIN_ACCENT = { ref: '#34d399', proxy: '#38bdf8' }
 
 // geometry constants (world units)
 const CW = 2.2 // storage cell width
@@ -115,6 +117,10 @@ interface Rel {
   span: Span
   title: string
   detail: string
+  /** read from the chain: an address a contract holds, or a proxy's implementation */
+  chain?: 'ref' | 'proxy'
+  /** the road sign's small print, when not the default */
+  tag?: string
 }
 
 interface City {
@@ -304,7 +310,23 @@ export class Scene3D {
     this.fitEnvironment()
     if (!this.built) this.frameAll(false)
     this.built = true
-    this.focus(this.selection)
+    this.focus(this.carry(this.selection))
+  }
+
+  /** The selection was made in the code before this build: the same items in the new code, or nothing. */
+  private carry(sel: Selection): Selection {
+    const contract = sel.contract && this.byName.get(sel.contract.name)
+    if (!contract) return { line: sel.line }
+    const fn = sel.fn && contract.fns.find((f) => f.id === sel.fn!.id)
+    return {
+      contract,
+      fn,
+      stmt: fn && sel.fn && sel.stmt ? fn.statements[sel.fn.statements.indexOf(sel.stmt)] : undefined,
+      v: sel.v && contract.vars.find((x) => x.id === sel.v!.id),
+      ev: sel.ev && contract.events.find((x) => x.id === sel.ev!.id),
+      err: sel.err && contract.errors.find((x) => x.id === sel.err!.id),
+      line: sel.line,
+    }
   }
 
   private clear() {
@@ -490,7 +512,8 @@ export class Scene3D {
     edges.position.copy(plate.position)
     g.add(edges)
     this.pick(plate, { type: 'contract', key: c.id, span: c.span, title: `${c.kind} ${c.name}`, detail: c.bases.length ? `is ${c.bases.join(', ')}` : '' }, [c.id])
-    const kindTag = c.kind === 'contract' ? '' : `<span class="tag">${c.kind}</span>`
+    const kindTag = (c.kind === 'contract' ? '' : `<span class="tag">${c.kind}</span>`)
+      + (c.address ? `<span class="tag addr" title="${c.address}">${c.address.slice(0, 6)}…${c.address.slice(-4)}${c.unverified ? ' · not verified' : ''}</span>` : '')
     this.label(g, `${c.name}${kindTag}`, 'lbl contract', new THREE.Vector3(x1 + 0.3, PLATE_Y, zA), c.id, true, [0, 1])
     this.focusTargets.set(c.id, new THREE.Vector3(ox + (x1 + x2) / 2, 0, (zA + zB) / 2))
     return { group: g, width: x2 - x1, back: zA, edge: zB, frontStreet, backStreet, rowStreets, cols: colStreets.map((cx) => ox + cx) }
@@ -524,8 +547,40 @@ export class Scene3D {
       if (o.first.startLine < cur.span.startLine) cur.span = o.first
       pairs.set(key, cur)
     }
+    // read from the chain (address imports): a proxy runs its implementation's code; a contract holds
+    // the address of another one. When code already calls between the two, that road says so instead.
+    const held = new Map<string, Rel & { vias: string[] }>()
+    const onCall = new Map<string, string[]>()
+    for (const l of model.links) {
+      if (!has(l.from) || !has(l.to) || l.from === l.to) continue
+      const at = this.byName.get(l.to)?.address
+      if (l.kind === 'proxy') {
+        rels.push({
+          key: `proxy:${l.from}>${l.to}`, from: l.from, to: l.to, kind: 'oneway', count: 3, span: l.span, chain: 'proxy', tag: 'proxy · delegatecall',
+          title: `${l.from} runs ${l.to}`, detail: `Proxy: every call to ${l.from} runs ${l.to}'s code (delegatecall) on ${l.from}'s storage${at ? ` · ${at}` : ''}`,
+        })
+        continue
+      }
+      const [a, b] = [l.from, l.to].sort()
+      const what = `${l.from}.${l.via} = ${l.to}${at ? ` (${at})` : ''}`
+      if (pairs.has(`call:${a}|${b}`)) {
+        onCall.set(`call:${a}|${b}`, [...(onCall.get(`call:${a}|${b}`) ?? []), what])
+        continue
+      }
+      const key = `chain:${a}|${b}`
+      const cur = held.get(key)
+      if (cur) {
+        cur.vias.push(l.via)
+        cur.detail += ` · ${what}`
+        cur.tag = `${cur.vias.join(', ')} · on-chain`
+        continue
+      }
+      const r = { key, from: l.from, to: l.to, kind: 'twoway' as const, count: 1, span: l.span, chain: 'ref' as const, vias: [l.via], tag: `${l.via} · on-chain`, title: `${l.from} ⇄ ${l.to}`, detail: `On-chain: ${what}` }
+      held.set(key, r)
+      rels.push(r)
+    }
     for (const p of pairs.values()) {
-      p.detail = [p.ab ? `${p.from} → ${p.to}: ${p.ab} call site${p.ab > 1 ? 's' : ''}` : '', p.ba ? `${p.to} → ${p.from}: ${p.ba} call site${p.ba > 1 ? 's' : ''}` : '']
+      p.detail = [p.ab ? `${p.from} → ${p.to}: ${p.ab} call site${p.ab > 1 ? 's' : ''}` : '', p.ba ? `${p.to} → ${p.from}: ${p.ba} call site${p.ba > 1 ? 's' : ''}` : '', ...(onCall.get(p.key) ?? []).map((w) => `on-chain: ${w}`)]
         .filter(Boolean).join(' · ')
       rels.push(p)
     }
@@ -534,10 +589,9 @@ export class Scene3D {
 
   /**
    * Cities on a 2D grid with corridors between them, like blocks of a bigger city.
-   * Every city's gate faces south, onto the horizontal corridor below its row. A road leaves through
-   * that corridor, turns into a vertical corridor if the other city is in another row, and enters the
-   * other city from the corridor below it. Each road gets its own lane in every corridor it uses, and
-   * corridors are as wide as their lanes need.
+   * Each city has gates on all four sides; a road leaves by the side facing the other city, takes its
+   * own lane in each corridor it travels (an L or a Z), and enters the other city the same way.
+   * Corridors are as wide as their lanes need.
    */
   private layoutCities(model: Model) {
     const order = this.cityOrder(model)
@@ -883,18 +937,19 @@ export class Scene3D {
   }
 
   private addHighway(r: Rel, path: THREE.Vector3[]) {
-    const hw = highway(path, r.kind, r.count, ROAD_ACCENT[r.kind])
+    const hw = highway(path, r.kind, r.count, r.chain ? CHAIN_ACCENT[r.chain] : ROAD_ACCENT[r.kind], undefined, r.chain === 'ref' ? CHAIN_ACCENT.ref : undefined)
     this.root.add(hw.group)
-    const ref: Ref = { type: 'road', key: r.key, span: r.span, title: r.kind === 'oneway' ? `${r.title}  (inheritance)` : `${r.title}  (calls)`, detail: r.detail }
+    const what = r.chain === 'proxy' ? 'proxy' : r.chain === 'ref' ? 'on-chain' : r.kind === 'oneway' ? 'inheritance' : 'calls'
+    const ref: Ref = { type: 'road', key: r.key, span: r.span, title: `${r.title}  (${what})`, detail: r.detail }
     for (const m of hw.asphalt) {
       m.userData.baseOpacity = 1
       m.userData.baseEmissive = (m.material as THREE.MeshStandardMaterial).emissive.clone()
       this.pick(m, ref, [r.key])
     }
-    const text = r.kind === 'oneway'
-      ? `${r.from} <span class="arrow">➜</span> ${r.to}<span class="tag">inherits · one-way</span>`
-      : `${r.from} <span class="arrow">⇄</span> ${r.to}<span class="tag">${r.count} call${r.count > 1 ? 's' : ''} · two-way</span>`
-    const label = this.label(this.root, text, `lbl road ${r.kind}`, hw.labelPos, undefined, true, [0.5, 1])
+    const tag = r.tag ?? (r.kind === 'oneway' ? 'inherits · one-way' : `${r.count} call${r.count > 1 ? 's' : ''} · two-way`)
+    const text = `${r.from} <span class="arrow">${r.kind === 'oneway' ? '➜' : '⇄'}</span> ${r.to}<span class="tag">${esc(tag)}</span>`
+    const cls = `lbl road ${r.kind}${r.chain === 'ref' ? ' chain' : r.chain === 'proxy' ? ' proxy' : ''}`
+    const label = this.label(this.root, text, cls, hw.labelPos, undefined, true, [0.5, 1])
     for (const m of hw.paint) m.userData.base = m.emissiveIntensity
     this.roads.set(r.key, { ...hw, label: label.element, boost: 1 })
   }
@@ -908,6 +963,7 @@ export class Scene3D {
       for (const b of c.bases) bump(c.name, b, 3)
       for (const o of c.callsOut) bump(c.name, o.target, o.count)
     }
+    for (const l of model.links) bump(l.from, l.to, 3)
     const weight = (a: string, b: string) => w.get(key(a, b)) ?? 0
     const degree = (a: string) => model.contracts.reduce((n, c) => n + weight(a, c.name), 0)
     const rest = [...model.contracts]

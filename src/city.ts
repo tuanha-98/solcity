@@ -268,9 +268,9 @@ function band(parent: THREE.Object3D, S: Sample[], off: number, w: number, lift:
 /**
  * A road along an axis-aligned route.
  * one-way: single lane, chevrons and cars all heading from path start to end.
- * two-way: two lanes with a dashed centre line, cars both ways.
+ * two-way: two lanes with a dashed centre line (yellow unless `line` is given), cars both ways.
  */
-export function highway(path: THREE.Vector3[], kind: 'oneway' | 'twoway', traffic: number, accent: string, ground = 0.01): Highway {
+export function highway(path: THREE.Vector3[], kind: 'oneway' | 'twoway', traffic: number, accent: string, ground = 0.01, line?: string): Highway {
   const group = new THREE.Group()
   const width = kind === 'oneway' ? 1.6 : 2.7
   // inner edge of every bend keeps a radius of about 1: wider roads swing wider
@@ -292,9 +292,9 @@ export function highway(path: THREE.Vector3[], kind: 'oneway' | 'twoway', traffi
   const cars: Car[] = []
   const lane = (off: number) => S.map(({ p, n }) => p.clone().addScaledVector(n, off).setY(p.y + 0.03))
   if (kind === 'twoway') {
-    const yellow = mat('#facc15', { emissive: '#a16207', emissiveIntensity: 0.5, side: DS })
-    paint.push(yellow)
-    band(group, S, 0, 0.08, 0.036, yellow, { keep: (i) => S[i].s % 1.0 < 0.55 })
+    const centre = line ? mat(line, { emissive: line, emissiveIntensity: 0.4, side: DS }) : mat('#facc15', { emissive: '#a16207', emissiveIntensity: 0.5, side: DS })
+    paint.push(centre)
+    band(group, S, 0, 0.08, 0.036, centre, { keep: (i) => S[i].s % 1.0 < 0.55 })
     const lanes = [lane(0.62), lane(-0.62).reverse()]
     const n = Math.min(Math.max(traffic, 1) * 2, 10)
     for (let i = 0; i < n; i++) cars.push(spawn(group, lanes[i % 2], i, n))

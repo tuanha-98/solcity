@@ -61,9 +61,9 @@ export async function fetchRaw(owner: string, repo: string, ref: string, path: s
 // ---------------------------------------------------------------------------
 // flattening: the chosen file first, then every file it imports (recursively), imports commented out
 
-const IMPORT_RE = /^[ \t]*import\s+(?:[^;]*?\bfrom\s+)?["']([^"']+)["'][^;]*;/gm
+export const IMPORT_RE = /^[ \t]*import\s+(?:[^;]*?\bfrom\s+)?["']([^"']+)["'][^;]*;/gm
 
-function join(dir: string, rel: string) {
+export function join(dir: string, rel: string) {
   const out = dir ? dir.split('/') : []
   for (const seg of rel.split('/')) {
     if (seg === '..') out.pop()
@@ -71,7 +71,7 @@ function join(dir: string, rel: string) {
   }
   return out.join('/')
 }
-const dirOf = (p: string) => p.split('/').slice(0, -1).join('/')
+export const dirOf = (p: string) => p.split('/').slice(0, -1).join('/')
 
 type Source = { kind: 'repo'; path: string } | { kind: 'npm'; path: string }
 

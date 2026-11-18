@@ -4,6 +4,7 @@ import { analyze, itemsAtLine, type Model, type Span } from './model'
 import { Scene3D, STMT_COLORS, STMT_LABEL, type Ref } from './scene'
 import { SAMPLE, OLD_SAMPLE_HASHES, hashText } from './sample'
 import { defaultBranch, fetchRaw, flatten, listSolidity, parseGitHubUrl, type RepoRef } from './github'
+import { CHAINS, importFromChain, parseTarget } from './onchain'
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
 const store = {
@@ -208,6 +209,81 @@ async function ghLoadFile(r: RepoRef & { ref: string }) {
     gh.dlg.close()
   }
 }
+// ---------- import from an EVM address ----------
+const ad = {
+  dlg: $<HTMLDialogElement>('addr'),
+  form: $<HTMLFormElement>('addr-form'),
+  chain: $<HTMLSelectElement>('addr-chain'),
+  input: $<HTMLInputElement>('addr-input'),
+  go: $<HTMLButtonElement>('addr-go'),
+  depth: $<HTMLSelectElement>('addr-depth'),
+  full: $<HTMLInputElement>('addr-full'),
+  key: $<HTMLInputElement>('addr-key'),
+  rpc: $<HTMLInputElement>('addr-rpc'),
+  status: $('addr-status'),
+  log: $<HTMLUListElement>('addr-log'),
+}
+ad.chain.innerHTML = CHAINS.map((c) => `<option value="${c.id}">${c.name}</option>`).join('')
+ad.chain.value = store.get('solcity:chain') ?? '1'
+if (!ad.chain.value) ad.chain.value = '1'
+ad.depth.value = store.get('solcity:depth') ?? '1'
+const adSay = (msg: string, err = false) => { ad.status.textContent = msg; ad.status.className = `gh-status${err ? ' err' : ''}` }
+const adLog = (line: string, kind?: 'ok' | 'warn') => {
+  const li = document.createElement('li')
+  li.textContent = line
+  if (kind) li.className = kind
+  ad.log.append(li)
+  li.scrollIntoView({ block: 'nearest' })
+}
+const rpcKey = () => `solcity:rpc:${ad.chain.value}`
+
+$('address').addEventListener('click', () => {
+  if (!ad.input.value) ad.input.value = store.get('solcity:addr') ?? ''
+  ad.key.value = store.get('solcity:etherscan-key') ?? ''
+  ad.rpc.value = store.get(rpcKey()) ?? ''
+  ad.dlg.showModal()
+  ad.input.focus()
+  ad.input.select()
+})
+$('addr-close').addEventListener('click', () => ad.dlg.close())
+ad.chain.addEventListener('change', () => (ad.rpc.value = store.get(rpcKey()) ?? ''))
+// an explorer link names its chain: pick it as soon as one is pasted
+ad.input.addEventListener('input', () => {
+  try {
+    const t = parseTarget(ad.input.value, Number(ad.chain.value))
+    if (t.chainFromLink && CHAINS.some((c) => c.id === t.chainId)) ad.chain.value = String(t.chainId)
+  } catch { /* not a whole address yet */ }
+})
+ad.form.addEventListener('submit', async (e) => {
+  e.preventDefault()
+  ad.go.disabled = true
+  ad.log.replaceChildren()
+  try {
+    const t = parseTarget(ad.input.value, Number(ad.chain.value))
+    const chain = CHAINS.find((c) => c.id === t.chainId)
+    if (!chain) throw new Error(`Chain ${t.chainId} is not one solcity knows; pick a chain from the list and paste the bare address`)
+    ad.chain.value = String(chain.id)
+    store.set('solcity:addr', ad.input.value.trim())
+    store.set('solcity:chain', String(chain.id))
+    store.set('solcity:depth', ad.depth.value)
+    store.set('solcity:etherscan-key', ad.key.value.trim())
+    store.set(rpcKey(), ad.rpc.value.trim())
+    const depth = Number(ad.depth.value)
+    adSay(`Reading ${chain.name}…`)
+    const out = await importFromChain({
+      chain, address: t.address, depth, max: depth > 1 ? 20 : 12, fullRelated: ad.full.checked,
+      etherscanKey: ad.key.value.trim() || undefined, rpc: ad.rpc.value.trim() || undefined, onProgress: adLog,
+    })
+    loadCode(out.source, out.label)
+    if (out.warnings.length) adSay(`Loaded ${out.contracts} contract${out.contracts > 1 ? 's' : ''}; ${out.warnings.length} could not be read fully (above).`, true)
+    else ad.dlg.close()
+  } catch (err) {
+    adSay((err as Error).message, true)
+  } finally {
+    ad.go.disabled = false
+  }
+})
+
 $('fit').addEventListener('click', () => scene.frameAll())
 const follow = $<HTMLInputElement>('follow')
 follow.addEventListener('change', () => (scene.followCamera = follow.checked))
@@ -275,6 +351,7 @@ $('legend').innerHTML = `
   <span><i class="ln" style="--c:#fb7185"></i>modifier</span><span><i class="ln" style="--c:#facc15"></i>calls other contract</span><span><i class="ln" style="--c:#ef4444"></i>reverts with error</span>
   <div class="lg-title">Roads between cities (contracts)</div>
   <span><i class="ln" style="--c:#a78bfa"></i>one-way: inheritance</span><span><i class="ln dash" style="--c:#facc15"></i>two-way: calls</span>
+  <span><i class="ln dash" style="--c:#34d399"></i>on-chain: holds its address</span><span><i class="ln" style="--c:#38bdf8"></i>proxy: runs this code</span>
   <span class="row">where roads cross, the north–south road takes an overpass</span>
   <div class="lg-title">Towers</div>
   <span><i class="sq" style="--c:#8b5cf6"></i>external</span><span><i class="sq" style="--c:#3b82f6"></i>public</span>

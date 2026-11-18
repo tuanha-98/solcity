@@ -31,6 +31,9 @@ Cities are joined by **highways**:
   the derived contract can use the base's code, not the other way round.
 - **two-way road** (yellow centre line) = calls between contracts (`token.transfer()`,
   `IERC20(x).approve()`, `new Foo()`); more call sites = more traffic.
+- **on-chain road** (green centre line) = one contract holds the other's address on the chain (an
+  [address import](#import-from-an-address): `token0()`, `factory()`, a constant…).
+- **proxy road** (blue, chevrons) = a proxy runs the implementation's code (delegatecall) on its own storage.
 
 Cities sit on a 2D grid (columns chosen from the pane's shape, snake order so connected cities stay
 neighbours), with corridors between them. Gates are on all four sides of a city: north and south edges
@@ -73,12 +76,50 @@ commented out), so base contracts, interfaces and libraries from other files bec
 Files come from `raw.githubusercontent.com`; listing a repo uses the GitHub API, which allows about
 60 requests per hour without sign-in. Private repos are not supported.
 
+## Import from an address
+
+**Address** in the toolbar takes a contract address and a chain, or an explorer link that names the chain
+(`etherscan.io/address/0x…`, `basescan.org/token/0x…`, a Blockscout link, or `eip155:<chain>:0x…`).
+Ethereum, Base, Arbitrum, OP, Polygon, BNB Chain, Avalanche, Gnosis, Linea, Scroll, Unichain, Sepolia and
+Base Sepolia are listed.
+
+1. The verified source of the address comes from Sourcify, then Blockscout (neither needs a key), then
+   Etherscan if you add your own API key. Its files are joined into one, imports commented out.
+2. If it is a proxy (EIP-1967, EIP-1822, ZeppelinOS, beacon, EIP-1167 clone, or what the explorer
+   reports), its implementation is loaded too and joined by a proxy road.
+3. **Follow** reads what it points to from the chain: every view function without arguments that
+   returns an address (`factory()`, `token0()`, `owner()`…, called on the proxy for an implementation),
+   the EIP-1967 admin and beacon, and addresses written in its code. Each one that is a contract joins
+   as a city with an on-chain road, to one or two hops. Accounts that are not contracts are noted in the
+   header.
+
+Related contracts come with the contracts they inherit from; tick **with their libraries and interfaces**
+for everything they compile with. Libraries, interfaces and bases shared by several addresses are kept
+once (the first copy); a deployed contract whose name is taken by different code is renamed `Name_1a2b`.
+A contract with no verified source is an empty city marked *not verified*.
+
+The text starts with what was read, in lines the city is drawn from (edit or delete them freely):
+
+```solidity
+// @chain 1 Ethereum
+// @contract UniswapV3Pool 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640
+// @contract FiatTokenProxy 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+// @link UniswapV3Pool.token0 -> FiatTokenProxy
+// @proxy FiatTokenProxy -> FiatTokenV2_2
+```
+
+Chain state comes from public PublicNode endpoints (BNB Chain: `bsc-dataseed.bnbchain.org`); another
+JSON-RPC URL can be set per chain. The key and RPC URL are kept in the browser's local storage.
+Vyper contracts are skipped.
+
 ## Files
 
 - `src/model.ts`: parse (`@solidity-parser/parser`) → contracts, storage layout, statements, reads/writes
 - `src/scene.ts`: three.js scene, city layout, highway routing, links, focus, picking
 - `src/architecture.ts`: building styles; `src/city.ts`: streets, lights, highways, cars
 - `src/github.ts`: GitHub links, repo listing, import flattening
+- `src/onchain.ts`: import from an address (verified source, proxies, related contracts, chain reads);
+  `src/keccak.ts`: Keccak-256 for selectors, storage slots and checksums
 - `src/editor.ts`: Monaco setup; `src/main.ts`: wiring
 
 Storage slots include inherited variables when the base contracts are in the same file. If a base is
