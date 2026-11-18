@@ -132,10 +132,14 @@ export function analyze(source: string): ParseResult {
   const errors = (ast.errors ?? []).map((e) => ({ line: e.line, column: e.column, message: e.message }))
   const lines = source.split('\n')
   const ctx = new Ctx(lines, ast, source)
-  const contracts = ast.children
-    .filter((c): c is AST.ContractDefinition => c.type === 'ContractDefinition')
-    .map((c) => ctx.contract(c))
-  return { model: { contracts }, errors }
+  try {
+    const contracts = ast.children
+      .filter((c): c is AST.ContractDefinition => c.type === 'ContractDefinition')
+      .map((c) => ctx.contract(c))
+    return { model: { contracts }, errors }
+  } catch (e) {
+    return { errors: [...errors, { line: 0, column: 0, message: `Could not analyse this code: ${(e as Error).message}` }] }
+  }
 }
 
 const ELEMENTARY_BYTES: Record<string, number> = { bool: 1, address: 20, byte: 1 }
@@ -144,6 +148,7 @@ class Ctx {
   private structDefs = new Map<string, AST.StructDefinition>()
   private enumNames = new Set<string>()
   private contractDefs = new Map<string, AST.ContractDefinition>()
+  private structStack = new Set<string>()
   /** variable name → contract type name, for parameters / returns of each function */
   private scopes = new WeakMap<Fn, Map<string, string>>()
   private layoutCache = new Map<string, { end: number; offset: number; unknown: boolean }>()
@@ -383,7 +388,16 @@ class Ctx {
       case 'UserDefinedTypeName': {
         const name = t.namePath.split('.').pop()!
         const s = this.structDefs.get(name)
-        if (s) return { shape: 'struct', bytes: 32, slots: this.structSlots(s), label: t.namePath }
+        if (s) {
+          // a struct reachable from itself (through a mapping or array) must not recurse forever
+          if (this.structStack.has(name)) return { shape: 'struct', bytes: 32, slots: 1, label: t.namePath }
+          this.structStack.add(name)
+          try {
+            return { shape: 'struct', bytes: 32, slots: this.structSlots(s), label: t.namePath }
+          } finally {
+            this.structStack.delete(name)
+          }
+        }
         if (this.enumNames.has(name)) return { shape: 'value', bytes: 1, slots: 1, label: t.namePath }
         if (this.contractDefs.has(name) || /^I[A-Z]/.test(name)) return { shape: 'value', bytes: 20, slots: 1, label: t.namePath }
         return { shape: 'value', bytes: 32, slots: 1, label: t.namePath }

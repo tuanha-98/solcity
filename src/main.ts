@@ -21,13 +21,14 @@ const scene = new Scene3D($('view'), { onPick: jumpTo, onHover: hoverCode })
 
 // ---------- parse → 3D ----------
 let lastEditLine = 1
+let drawError = ''
 /** after loading new code, frame the whole map on the next build */
 let fitNext = false
 let sourceLabel = ''
 function update() {
   const { model: m, errors: raw } = analyze(editor.getValue())
   // when the parser cannot locate the error, the line just edited is the best guess
-  const errors = raw.map((e) => (e.line ? e : { ...e, line: lastEditLine, message: `${e.message} near here` }))
+  const errors = raw.map((e) => (e.line ? e : { ...e, line: lastEditLine, message: e.message === 'Syntax error' ? `${e.message} near here` : e.message }))
   monaco.editor.setModelMarkers(text, 'solidity', errors.map((e) => ({
     severity: monaco.MarkerSeverity.Error,
     message: e.message,
@@ -36,12 +37,22 @@ function update() {
   })))
   const status = $('status')
   if (m && (m.contracts.length || !errors.length)) {
-    model = m
-    scene.build(m)
-    syncCursor()
-    if (fitNext) { scene.frameAll(); fitNext = false }
+    drawError = ''
+    try {
+      model = m
+      scene.build(m)
+      syncCursor()
+      if (fitNext) { scene.frameAll(); fitNext = false }
+    } catch (err) {
+      // a bug in drawing must not take the page down: say so and keep the editor usable
+      console.error(err)
+      drawError = `Could not draw this code: ${(err as Error).message}`
+    }
   }
-  if (errors.length) {
+  if (drawError) {
+    status.className = 'status err'
+    status.textContent = drawError
+  } else if (errors.length) {
     status.className = 'status err'
     status.textContent = `Line ${errors[0].line}: ${errors[0].message}${model ? ' · showing last valid version' : ''}`
   } else if (model) {

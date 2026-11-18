@@ -49,6 +49,7 @@ const PLATE_Y = 0.2
 const PLINTH_H = 0.3
 const FOUND_H = 0.1 // foundation slab of storage / temple / mast / cone lots
 const LOT = 2.85 // a tower's foundation: the full width of its lot
+const MAX_LOT_CELLS = 3 // widest a storage lot is drawn, however many slots its variable spans
 const FLOOR_H = 0.42
 const TOWER_W = 2.1
 const TOWER_PITCH_X = 3.9
@@ -329,34 +330,42 @@ export class Scene3D {
     this.root.add(g)
 
     // ---- storage row (z = 0) ----
+    // Lots in slot order: one slot (packed variables share it) or one variable that spans several
+    // slots. A variable spanning many slots (e.g. Observation[65535]) is drawn at most MAX_LOT_CELLS
+    // cells wide and labelled with its slot range, so the row grows with variables, not with slots.
     const stored = c.vars.filter((v) => !v.constant && !v.immutable).sort((a, b) => a.slot - b.slot || a.offset - b.offset)
-    const first = stored.length ? stored[0].slot : 0
-    let maxX = 0
-    const cellX = (slot: number) => (slot - first) * (CW + GAP)
-    const slotsSeen = new Set<number>()
-    // each storage slot is a lot with its own foundation; packed variables share it
-    const inSlot = new Map<number, StateVar[]>()
-    for (const v of stored) for (let s = v.slot; s < v.slot + (v.shape === 'value' ? 1 : v.slots); s++) inSlot.set(s, [...(inSlot.get(s) ?? []), v])
-    for (const [slot, vs] of inSlot) {
-      const owners = vs.map((v) => v.id)
-      this.foundation(g, this.maker(this.varRef(vs[0]), owners), owners, cellX(slot) + CW / 2, 0, CW, CD, '#252a3a')
-    }
+    const lots: { start: number; end: number; vars: StateVar[]; cells: number }[] = []
     for (const v of stored) {
-      const x0 = cellX(v.slot) + (v.shape === 'value' ? (v.offset / 32) * CW : 0)
-      const w = v.shape === 'value' ? Math.max((v.bytes / 32) * CW, 0.22) : v.slots * CW + (v.slots - 1) * GAP
-      const obj = this.varObject(v, w, false)
-      obj.position.set(x0 + w / 2, PLATE_Y + FOUND_H, 0)
-      g.add(obj)
-      maxX = Math.max(maxX, x0 + w)
-      const top = this.topOf(obj)
-      this.label(g, v.name, 'lbl var', new THREE.Vector3(x0 + w / 2, top + 0.25, 0), v.id)
-      this.anchors.set(v.id, new THREE.Vector3(ox + x0 + w / 2, top, 0))
-      this.focusTargets.set(v.id, new THREE.Vector3(ox + x0 + w / 2, top, 0))
-      for (let s = v.slot; s < v.slot + (v.shape === 'value' ? 1 : v.slots); s++) {
-        if (slotsSeen.has(s)) continue
-        slotsSeen.add(s)
-        this.label(g, `${c.slotsUnknownBase ? '+' : ''}slot ${s}`, 'lbl slot', new THREE.Vector3(cellX(s) + CW / 2, PLATE_Y, CD / 2 + 0.3))
+      const span = v.shape === 'value' ? 1 : Math.max(v.slots, 1)
+      const last = lots[lots.length - 1]
+      if (v.shape === 'value' && last && last.start === v.slot && last.end === v.slot && last.vars[0].shape === 'value') {
+        last.vars.push(v)
+        continue
       }
+      lots.push({ start: v.slot, end: v.slot + span - 1, vars: [v], cells: Math.min(span, MAX_LOT_CELLS) })
+    }
+    let maxX = 0
+    let lx = 0
+    for (const lot of lots) {
+      const lw = lot.cells * CW + (lot.cells - 1) * GAP
+      const owners = lot.vars.map((v) => v.id)
+      this.foundation(g, this.maker(this.varRef(lot.vars[0]), owners), owners, lx + lw / 2, 0, lw, CD, '#252a3a')
+      const pre = c.slotsUnknownBase ? '+' : ''
+      const slotText = lot.start === lot.end ? `${pre}slot ${lot.start}` : `${pre}slots ${lot.start}–${lot.end}`
+      this.label(g, slotText, 'lbl slot', new THREE.Vector3(lx + lw / 2, PLATE_Y, CD / 2 + 0.3))
+      for (const v of lot.vars) {
+        const x0 = lx + (v.shape === 'value' ? (v.offset / 32) * CW : 0)
+        const w = v.shape === 'value' ? Math.max((v.bytes / 32) * CW, 0.22) : lw
+        const obj = this.varObject(v, w, false)
+        obj.position.set(x0 + w / 2, PLATE_Y + FOUND_H, 0)
+        g.add(obj)
+        maxX = Math.max(maxX, x0 + w)
+        const top = this.topOf(obj)
+        this.label(g, v.name, 'lbl var', new THREE.Vector3(x0 + w / 2, top + 0.25, 0), v.id)
+        this.anchors.set(v.id, new THREE.Vector3(ox + x0 + w / 2, top, 0))
+        this.focusTargets.set(v.id, new THREE.Vector3(ox + x0 + w / 2, top, 0))
+      }
+      lx += lw + GAP
     }
     // constants / immutables live in bytecode, not storage: glass blocks after the row
     let cx = stored.length ? maxX + 1.2 : 0

@@ -85,14 +85,11 @@ export interface Flattened {
 
 export async function flatten(r: RepoRef & { ref: string }, opts: { maxFiles?: number; onProgress?: (msg: string) => void } = {}): Promise<Flattened> {
   const max = opts.maxFiles ?? 60
-  let tree: Set<string> | undefined
-  const repoFiles = async () => {
-    tree ??= new Set((await listSolidity(r.owner, r.repo, r.ref)).files)
-    return tree
-  }
-  const seen = new Map<string, string>() // key → text
-  const order: string[] = []
+  // the repo listing is fetched once, even when many imports ask for it at the same time
+  let tree: Promise<Set<string>> | undefined
+  const repoFiles = () => (tree ??= listSolidity(r.owner, r.repo, r.ref).then((t) => new Set(t.files)).catch(() => new Set<string>()))
   const missing: string[] = []
+  const miss = (x: string) => { if (!missing.includes(x)) missing.push(x) }
 
   const load = async (src: Source): Promise<string> =>
     src.kind === 'repo'
@@ -127,32 +124,58 @@ export async function flatten(r: RepoRef & { ref: string }, opts: { maxFiles?: n
     return undefined
   }
 
-  const visit = async (src: Source) => {
-    const key = `${src.kind}:${src.path}`
-    if (seen.has(key) || order.length >= max) return
-    opts.onProgress?.(`Loading ${src.path}…`)
-    let text: string
-    try {
-      text = await load(src)
-    } catch {
-      missing.push(src.path)
-      return
-    }
-    seen.set(key, text)
-    order.push(key)
-    for (const m of text.matchAll(IMPORT_RE)) {
-      const dep = await resolve(src, m[1])
-      if (dep) await visit(dep)
-      else if (!missing.includes(m[1])) missing.push(m[1])
-    }
+  // Fetch the import graph in parallel. Each file resolves as soon as it is loaded and its imports
+  // are known; its imports are fetched on their own, so circular imports cannot deadlock.
+  type Node = { text: string; deps: string[] } | undefined
+  const nodes = new Map<string, Promise<Node>>()
+  const keyOf = (s: Source) => `${s.kind}:${s.path}`
+  let loaded = 0
+  const visit = (src: Source) => {
+    const key = keyOf(src)
+    if (nodes.has(key) || nodes.size >= max) return
+    nodes.set(key, (async (): Promise<Node> => {
+      let text: string
+      try {
+        text = await load(src)
+      } catch {
+        miss(src.path)
+        return undefined
+      }
+      opts.onProgress?.(`Loaded ${++loaded} file${loaded > 1 ? 's' : ''}… (${src.path})`)
+      const deps: string[] = []
+      for (const m of text.matchAll(IMPORT_RE)) {
+        const dep = await resolve(src, m[1])
+        if (!dep) { miss(m[1]); continue }
+        deps.push(keyOf(dep))
+        visit(dep)
+      }
+      return { text, deps }
+    })())
   }
-
-  await visit({ kind: 'repo', path: r.path })
-  if (!order.length) throw new Error(`Could not load ${r.path}`)
+  const root: Source = { kind: 'repo', path: r.path }
+  visit(root)
+  // wait until no new files are being started
+  for (let settled = 0; settled < nodes.size;) {
+    const pending = [...nodes.values()]
+    await Promise.all(pending)
+    settled = pending.length
+  }
+  const done = new Map<string, NonNullable<Node>>()
+  for (const [k, p] of nodes) { const n = await p; if (n) done.set(k, n) }
+  if (!done.has(keyOf(root))) throw new Error(`Could not load ${r.path}`)
+  // the chosen file first, then its imports depth-first
+  const order: string[] = []
+  const walk = (k: string) => {
+    if (order.includes(k) || !done.has(k)) return
+    order.push(k)
+    for (const d of done.get(k)!.deps) walk(d)
+  }
+  walk(keyOf(root))
+  if (nodes.size >= max) miss(`(stopped after ${max} files)`)
 
   const label = (key: string) => (key.startsWith('npm:') ? key.slice(4) : key.slice(5))
   const parts = order.map((key, i) => {
-    const body = seen.get(key)!.replace(IMPORT_RE, (line) => `// ${line.trim()}  (flattened)`)
+    const body = done.get(key)!.text.replace(IMPORT_RE, (line) => `// ${line.trim()}  (flattened)`)
     return i === 0 ? body : `\n// ===== imported: ${label(key)} =====\n${body}`
   })
   return { source: parts.join('\n'), files: order.map(label), missing }
