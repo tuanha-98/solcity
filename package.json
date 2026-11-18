@@ -1,0 +1,22 @@
+{
+  "name": "solcity",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@solidity-parser/parser": "^0.20.2",
+    "monaco-editor": "^0.57.0",
+    "three": "^0.187.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.187.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  },
+  "description": "Solidity code as a 3D city: functions are high-rises, contracts are cities, calls and inheritance are roads."
+}

@@ -1,0 +1,284 @@
+import './style.css'
+import { createEditor, monaco } from './editor'
+import { analyze, itemsAtLine, type Model, type Span } from './model'
+import { Scene3D, STMT_COLORS, STMT_LABEL, type Ref } from './scene'
+import { SAMPLE, OLD_SAMPLE_HASHES, hashText } from './sample'
+import { defaultBranch, fetchRaw, flatten, listSolidity, parseGitHubUrl, type RepoRef } from './github'
+
+const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
+const store = {
+  get: (k: string) => { try { return localStorage.getItem(k) } catch { return null } },
+  set: (k: string, v: string) => { try { localStorage.setItem(k, v) } catch { /* storage unavailable */ } },
+}
+
+// a stored copy of an older built-in sample is replaced by the current one; real edits are kept
+const stored = store.get('sol-blocks:code')
+const editor = createEditor($('code'), stored && !OLD_SAMPLE_HASHES.includes(hashText(stored)) ? stored : SAMPLE)
+const text = editor.getModel()!
+let model: Model | undefined
+
+const scene = new Scene3D($('view'), { onPick: jumpTo, onHover: hoverCode })
+
+// ---------- parse → 3D ----------
+let lastEditLine = 1
+/** after loading new code, frame the whole map on the next build */
+let fitNext = false
+let sourceLabel = ''
+function update() {
+  const { model: m, errors: raw } = analyze(editor.getValue())
+  // when the parser cannot locate the error, the line just edited is the best guess
+  const errors = raw.map((e) => (e.line ? e : { ...e, line: lastEditLine, message: `${e.message} near here` }))
+  monaco.editor.setModelMarkers(text, 'solidity', errors.map((e) => ({
+    severity: monaco.MarkerSeverity.Error,
+    message: e.message,
+    startLineNumber: e.line, startColumn: e.column + 1,
+    endLineNumber: e.line, endColumn: e.column ? e.column + 2 : 200,
+  })))
+  const status = $('status')
+  if (m && (m.contracts.length || !errors.length)) {
+    model = m
+    scene.build(m)
+    syncCursor()
+    if (fitNext) { scene.frameAll(); fitNext = false }
+  }
+  if (errors.length) {
+    status.className = 'status err'
+    status.textContent = `Line ${errors[0].line}: ${errors[0].message}${model ? ' · showing last valid version' : ''}`
+  } else if (model) {
+    const fns = model.contracts.reduce((n, c) => n + c.fns.length, 0)
+    const stmts = model.contracts.reduce((n, c) => n + c.fns.reduce((k, f) => k + f.statements.length, 0), 0)
+    status.className = 'status'
+    status.textContent = `${sourceLabel ? `${sourceLabel} · ` : ''}${model.contracts.length} contract${model.contracts.length === 1 ? '' : 's'} · ${fns} functions · ${stmts} statements`
+    status.title = status.textContent
+  }
+}
+
+let timer: number | undefined
+editor.onDidChangeModelContent((e) => {
+  lastEditLine = e.changes[0]?.range.startLineNumber ?? lastEditLine
+  clearTimeout(timer)
+  timer = window.setTimeout(() => {
+    update()
+    store.set('sol-blocks:code', editor.getValue())
+  }, 300)
+})
+
+// ---------- editor cursor → 3D focus ----------
+function syncCursor() {
+  if (!model) return
+  const line = editor.getPosition()?.lineNumber ?? 1
+  scene.focus(itemsAtLine(model, line))
+}
+editor.onDidChangeCursorPosition(() => syncCursor())
+
+// ---------- 3D → editor ----------
+let flash: monaco.editor.IEditorDecorationsCollection | undefined
+let flashTimer: number | undefined
+function jumpTo(ref: Ref) {
+  const start = text.getPositionAt(ref.span.start)
+  editor.setPosition(start)
+  editor.revealLineInCenterIfOutsideViewport(start.lineNumber, monaco.editor.ScrollType.Smooth)
+  editor.focus()
+  flash?.clear()
+  flash = editor.createDecorationsCollection([{ range: lineRange(ref.span), options: { isWholeLine: true, className: 'flash-range' } }])
+  clearTimeout(flashTimer)
+  flashTimer = window.setTimeout(() => flash?.clear(), 1400)
+}
+
+const hover = editor.createDecorationsCollection()
+function hoverCode(ref: Ref | null) {
+  // a whole contract would paint the entire file: mark just its header line
+  const span = ref?.type === 'contract' ? { ...ref.span, endLine: ref.span.startLine } : ref?.span
+  hover.set(ref && span ? [{ range: lineRange(span), options: { isWholeLine: true, className: 'hover-range', linesDecorationsClassName: 'hover-gutter' } }] : [])
+}
+
+function lineRange(s: Span) {
+  return new monaco.Range(s.startLine, 1, s.endLine, 1)
+}
+
+// ---------- toolbar ----------
+const fileInput = $<HTMLInputElement>('file')
+$('open').addEventListener('click', () => fileInput.click())
+fileInput.addEventListener('change', async () => {
+  const f = fileInput.files?.[0]
+  if (f) loadCode(await f.text(), f.name)
+  fileInput.value = ''
+})
+$('sample').addEventListener('click', () => loadCode(SAMPLE, ''))
+
+/** Replace the editor content with code from elsewhere and frame the new map. */
+function loadCode(code: string, label: string) {
+  sourceLabel = label
+  fitNext = true
+  editor.setValue(code)
+  editor.setPosition({ lineNumber: 1, column: 1 })
+  editor.revealLine(1)
+}
+
+// ---------- GitHub import ----------
+const gh = {
+  dlg: $<HTMLDialogElement>('gh'),
+  form: $<HTMLFormElement>('gh-form'),
+  url: $<HTMLInputElement>('gh-url'),
+  go: $<HTMLButtonElement>('gh-go'),
+  flatten: $<HTMLInputElement>('gh-flatten'),
+  status: $('gh-status'),
+  filter: $<HTMLInputElement>('gh-filter'),
+  list: $<HTMLUListElement>('gh-files'),
+}
+let ghFiles: { repo: RepoRef & { ref: string }; files: string[] } | undefined
+const ghSay = (msg: string, err = false) => { gh.status.textContent = msg; gh.status.className = `gh-status${err ? ' err' : ''}` }
+
+$('github').addEventListener('click', () => {
+  if (!gh.url.value) gh.url.value = store.get('sol-blocks:gh') ?? ''
+  gh.dlg.showModal()
+  gh.url.focus()
+  gh.url.select()
+})
+$('gh-close').addEventListener('click', () => gh.dlg.close())
+gh.form.addEventListener('submit', async (e) => {
+  e.preventDefault()
+  gh.go.disabled = true
+  try {
+    await ghOpen(gh.url.value)
+  } catch (err) {
+    ghSay((err as Error).message, true)
+  } finally {
+    gh.go.disabled = false
+  }
+})
+
+async function ghOpen(link: string) {
+  const r = parseGitHubUrl(link)
+  store.set('sol-blocks:gh', link.trim())
+  ghSay('Reading repository…')
+  const ref = r.ref ?? (await defaultBranch(r.owner, r.repo))
+  const repo = { ...r, ref }
+  if (r.kind === 'file') return ghLoadFile(repo)
+  const { files, truncated } = await listSolidity(r.owner, r.repo, ref)
+  const under = files.filter((f) => !r.path || f.startsWith(`${r.path}/`))
+  if (!under.length) throw new Error(`No .sol files under ${r.path || 'the repository root'}`)
+  // likely sources first; tests, scripts and vendored libraries last
+  const rank = (f: string) => (/(^|\/)(lib|node_modules)\//.test(f) ? 2 : /(^|\/)(test|tests|script|scripts|mocks?)\/|\.(t|s)\.sol$/.test(f) ? 1 : 0)
+  under.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+  ghFiles = { repo, files: under }
+  gh.filter.hidden = false
+  gh.filter.value = ''
+  renderGhFiles()
+  ghSay(`${under.length} Solidity file${under.length > 1 ? 's' : ''} in ${r.owner}/${r.repo}@${ref}${truncated ? ' (GitHub truncated the listing)' : ''}. Pick one:`)
+  gh.filter.focus()
+}
+
+function renderGhFiles() {
+  if (!ghFiles) return
+  const q = gh.filter.value.trim().toLowerCase()
+  const shown = ghFiles.files.filter((f) => !q || f.toLowerCase().includes(q)).slice(0, 400)
+  gh.list.replaceChildren(...shown.map((f) => {
+    const li = document.createElement('li')
+    const cut = f.lastIndexOf('/') + 1
+    const kind = /(^|\/)(lib|node_modules)\//.test(f) ? 'library' : /(^|\/)(test|tests)\/|\.t\.sol$/.test(f) ? 'test' : /(^|\/)(script|scripts)\/|\.s\.sol$/.test(f) ? 'script' : ''
+    li.innerHTML = `<span class="dir">${f.slice(0, cut)}</span><b>${f.slice(cut)}</b>${kind ? `<span class="tag">${kind}</span>` : ''}`
+    li.addEventListener('click', () => ghLoadFile({ ...ghFiles!.repo, path: f, kind: 'file' }).catch((err) => ghSay((err as Error).message, true)))
+    return li
+  }))
+}
+gh.filter.addEventListener('input', renderGhFiles)
+
+async function ghLoadFile(r: RepoRef & { ref: string }) {
+  ghSay(`Loading ${r.path}…`)
+  const out = gh.flatten.checked
+    ? await flatten(r, { onProgress: (m) => ghSay(m) })
+    : { source: await fetchRaw(r.owner, r.repo, r.ref, r.path), files: [r.path], missing: [] as string[] }
+  const extra = out.files.length - 1
+  loadCode(out.source, `${r.owner}/${r.repo} · ${r.path.split('/').pop()}${extra ? ` +${extra} imported` : ''}`)
+  if (out.missing.length) {
+    ghSay(`Loaded ${out.files.length} file${out.files.length > 1 ? 's' : ''}. Could not find: ${out.missing.join(', ')}`, true)
+  } else {
+    gh.dlg.close()
+  }
+}
+$('fit').addEventListener('click', () => scene.frameAll())
+const follow = $<HTMLInputElement>('follow')
+follow.addEventListener('change', () => (scene.followCamera = follow.checked))
+const all = $<HTMLInputElement>('all')
+all.addEventListener('change', () => {
+  scene.showAllLinks = all.checked
+  syncCursor()
+})
+
+// label visibility, remembered per browser
+const labelsMode = $<HTMLSelectElement>('labels-mode')
+const applyLabels = () => scene.setLabelMode(labelsMode.value as 'all' | 'cities' | 'off')
+labelsMode.value = store.get('solcity:labels') ?? 'all'
+applyLabels()
+labelsMode.addEventListener('change', () => {
+  store.set('solcity:labels', labelsMode.value)
+  applyLabels()
+})
+
+// drop a .sol file anywhere on the code pane
+const codePane = $('code-pane')
+codePane.addEventListener('dragover', (e) => { e.preventDefault(); codePane.classList.add('drop') })
+codePane.addEventListener('dragleave', () => codePane.classList.remove('drop'))
+codePane.addEventListener('drop', async (e) => {
+  e.preventDefault()
+  codePane.classList.remove('drop')
+  const f = e.dataTransfer?.files[0]
+  if (f) loadCode(await f.text(), f.name)
+})
+
+// resizable split
+const divider = $('divider')
+divider.addEventListener('pointerdown', (e) => {
+  divider.setPointerCapture(e.pointerId)
+  const move = (ev: PointerEvent) => {
+    const pct = Math.min(75, Math.max(25, (ev.clientX / window.innerWidth) * 100))
+    document.body.style.setProperty('--split', `${pct}%`)
+  }
+  const up = () => { divider.removeEventListener('pointermove', move); divider.removeEventListener('pointerup', up) }
+  divider.addEventListener('pointermove', move)
+  divider.addEventListener('pointerup', up)
+})
+
+// legend
+$('legend').innerHTML = `
+  <div class="lg-title">Storeys = lines of code (glass colour = statement kind)</div>
+  ${(['decl', 'assign', 'write', 'call', 'extcall', 'guard', 'if', 'loop', 'return', 'emit', 'revert'] as const)
+    .map((k) => `<span><i style="--c:${STMT_COLORS[k]}"></i>${STMT_LABEL[k]}</span>`).join('')}
+  <div class="lg-title">Buildings</div>
+  <span class="row"><b>function</b> high-rise, one storey per line, lit windows</span>
+  <span class="row"><b>modifier</b> castle keep: stone storeys, turrets, flag</span>
+  <span class="row"><b>interface / no body</b> glass tower · <b>_;</b> glass storey</span>
+  <span class="row"><b>state variable</b> warehouse with a pitched roof</span>
+  <span class="row"><b>constant</b> marble temple · <b>immutable</b> sandstone temple</span>
+  <span class="row"><b>event</b> radio mast sending rings</span>
+  <span class="row"><b>error</b> red and white traffic cone</span>
+  <div class="lg-title">Warehouse = data type</div>
+  <span><i class="sq" style="--c:#38bdf8"></i>value: shed</span><span><i class="sq" style="--c:#f59e0b"></i>mapping: lockers</span>
+  <span><i class="sq" style="--c:#34d399"></i>array: row of units</span><span><i class="sq" style="--c:#a78bfa"></i>struct: 2 storeys</span>
+  <span><i class="sq" style="--c:#f472b6"></i>string / bytes: sign</span>
+  <div class="lg-title">Links</div>
+  <span><i class="ln" style="--c:#22d3ee"></i>reads</span><span><i class="ln" style="--c:#fb923c"></i>writes</span>
+  <span><i class="ln" style="--c:#c084fc"></i>calls</span><span><i class="ln" style="--c:#f9a8d4"></i>emits</span>
+  <span><i class="ln" style="--c:#fb7185"></i>modifier</span><span><i class="ln" style="--c:#facc15"></i>calls other contract</span><span><i class="ln" style="--c:#ef4444"></i>reverts with error</span>
+  <div class="lg-title">Roads between cities (contracts)</div>
+  <span><i class="ln" style="--c:#a78bfa"></i>one-way: inheritance</span><span><i class="ln dash" style="--c:#facc15"></i>two-way: calls</span>
+  <span class="row">where roads cross, the north–south road takes an overpass</span>
+  <div class="lg-title">Towers</div>
+  <span><i class="sq" style="--c:#8b5cf6"></i>external</span><span><i class="sq" style="--c:#3b82f6"></i>public</span>
+  <span><i class="sq" style="--c:#64748b"></i>internal / private</span><span><i class="sq" style="--c:#fb7185"></i>modifier fence</span>
+  <div class="lg-title">Roofs = what it does with state</div>
+  <span class="row"><b>payable</b> gilded dome</span>
+  <span class="row"><b>view</b> glass observation deck</span>
+  <span class="row"><b>pure</b> roof garden</span>
+  <span class="row"><b>changes state</b> plant room and antenna</span>
+`
+$('legend-toggle').addEventListener('click', () => $('legend').classList.toggle('open'))
+
+update()
+// start on a line that calls another contract, so the first view shows a road in use
+const start = text.findMatches('asset.transferFrom', false, false, true, null, false)[0]?.range.startLineNumber ?? 1
+editor.setPosition({ lineNumber: start, column: 9 })
+editor.revealLineInCenter(start)
+
+if (import.meta.env.DEV) Object.assign(window, { __scene: scene, __editor: editor, __model: () => model })

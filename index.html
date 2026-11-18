@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>solcity</title>
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+  </head>
+  <body>
+    <header>
+      <div class="brand"><img class="logo" src="/logo.svg" alt="" />solcity</div>
+      <div class="tools">
+        <button id="open">Open .sol</button>
+        <input id="file" type="file" accept=".sol,text/plain" hidden />
+        <button id="github" class="ghost" title="Import from a public GitHub repo">GitHub</button>
+        <button id="sample" class="ghost">Sample</button>
+        <span class="sep"></span>
+        <label><input type="checkbox" id="follow" checked /> Camera follows cursor</label>
+        <label><input type="checkbox" id="all" /> All links on contract</label>
+        <label>Labels
+          <select id="labels-mode">
+            <option value="all">All</option>
+            <option value="cities">Cities &amp; roads</option>
+            <option value="off">Off</option>
+          </select>
+        </label>
+        <button id="fit" class="ghost">Fit view</button>
+      </div>
+      <div id="status" class="status"></div>
+    </header>
+    <main>
+      <section id="code-pane">
+        <div id="code"></div>
+      </section>
+      <div id="divider"></div>
+      <section id="view">
+        <button id="legend-toggle" class="ghost small">Legend</button>
+        <div id="legend"></div>
+        <div class="hint">Move the cursor in the code: the matching block lights up. Click a block to jump to its line.</div>
+      </section>
+    </main>
+    <dialog id="gh">
+      <form id="gh-form">
+        <h3>Import from GitHub</h3>
+        <p class="muted">Paste a link to a public repo, a folder (<code>/tree/…</code>) or a <code>.sol</code> file (<code>/blob/…</code>).</p>
+        <div class="gh-row">
+          <input id="gh-url" placeholder="https://github.com/owner/repo/blob/main/src/Token.sol" spellcheck="false" autocomplete="off" />
+          <button id="gh-go" type="submit">Load</button>
+        </div>
+        <label class="check"><input type="checkbox" id="gh-flatten" checked /> Include imported files too (their contracts become cities, with roads to them)</label>
+        <div id="gh-status" class="gh-status"></div>
+        <input id="gh-filter" placeholder="Filter files…" spellcheck="false" autocomplete="off" hidden />
+        <ul id="gh-files"></ul>
+        <div class="gh-foot"><button type="button" id="gh-close" class="ghost">Close</button></div>
+      </form>
+    </dialog>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
