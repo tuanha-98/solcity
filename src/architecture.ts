@@ -221,9 +221,14 @@ for (const t of [facade, stoneWall, ...lights]) t.userData.shared = true
 const edgeBox = shared(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)))
 
 /** One storey of a function tower: a concrete floor plate and a glass facade tinted by the statement kind. */
-export function storey(make: Make, size: number, h: number, color: string, style: 'office' | 'castle', translucent: boolean, seed: number) {
+/**
+ * One storey of a function tower: a floor plate as wide as the tower's tier (`slab`), and a glass
+ * facade tinted by the statement kind (`size`). Lines inside a block get a facade set back from the
+ * plate, like a balcony, so nesting shows without the tower ever getting wider higher up.
+ */
+export function storey(make: Make, slab: number, size: number, h: number, color: string, style: 'office' | 'castle', translucent: boolean, seed: number) {
   const g = new THREE.Group()
-  put(make, g, G.box, style === 'castle' ? '#57534e' : '#2c3245', [size + 0.08, 0.05, size + 0.08], [0, 0.025, 0])
+  put(make, g, G.box, style === 'castle' ? '#57534e' : '#2c3245', [slab + 0.08, 0.05, slab + 0.08], [0, 0.025, 0])
   const body = style === 'castle'
     ? put(make, g, G.box, color, [size, h - 0.05, size], [0, 0.05 + (h - 0.05) / 2, 0], { map: stoneWall, roughness: 0.9 })
     : put(make, g, G.box, color, [size, h - 0.05, size], [0, 0.05 + (h - 0.05) / 2, 0], {

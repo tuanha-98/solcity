@@ -50,6 +50,20 @@ const PLINTH_H = 0.3
 const FOUND_H = 0.1 // foundation slab of storage / temple / mast / cone lots
 const LOT = 2.85 // a tower's foundation: the full width of its lot
 const MAX_LOT_CELLS = 3 // widest a storage lot is drawn, however many slots its variable spans
+/** how far a storey's facade is set back per level of nesting (if / for / unchecked …) */
+const NEST_RECESS = 0.12
+
+/**
+ * Outline width of storey `i` of an `n`-storey tower. Short towers are one straight block; long
+ * ones step back in up to five tiers as they rise, like a setback skyscraper, so a storey is never
+ * wider than the one below it.
+ */
+function tierWidth(i: number, n: number) {
+  if (n <= 8) return TOWER_W
+  const tiers = Math.min(5, Math.max(2, Math.round(n / 10)))
+  const perTier = Math.ceil(n / tiers)
+  return TOWER_W * (1 - 0.12 * Math.floor(i / perTier))
+}
 const FLOOR_H = 0.42
 const TOWER_W = 2.1
 const TOWER_PITCH_X = 3.9
@@ -727,26 +741,28 @@ export class Scene3D {
     const byLine = new Map<number, THREE.Mesh>()
     let top = PLINTH_H
     let topSize = TOWER_W
-    for (const l of f.lines) {
+    f.lines.forEach((l, i) => {
       const st = f.statements[l.stmt]
       const kind = st?.kind ?? 'other'
-      const size = Math.max(TOWER_W - (st?.depth ?? 0) * 0.42, 0.55)
-      topSize = size
+      // the tier sets the outline (never wider going up); nesting only sets the facade back
+      const tier = f.kind === 'modifier' ? TOWER_W : tierWidth(i, f.lines.length)
+      const size = Math.max(tier - 2 * NEST_RECESS * Math.min(st?.depth ?? 0, 3), tier * 0.55)
+      topSize = tier
       const ref: Ref = {
         type: 'stmt', key: `${f.id}#L${l.line}`, title: STMT_LABEL[kind], detail: l.code.trim(),
-        span: { startLine: l.line, endLine: l.line, start: l.start, end: l.end },
+        span: { startLine: l.line, endLine: l.endLine, start: l.start, end: l.end },
       }
       const make = this.maker(ref, [f.id])
       const floor = kind === 'placeholder'
         ? glassStorey(make, this.framer([f.id]), size, FLOOR_H)
-        : storey(make, size, FLOOR_H, STMT_COLORS[kind], f.kind === 'modifier' ? 'castle' : 'office', readOnly, l.line)
+        : storey(make, tier, size, FLOOR_H, STMT_COLORS[kind], f.kind === 'modifier' ? 'castle' : 'office', readOnly, l.line)
       floor.group.position.y = top
       g.add(floor.group)
       floor.body.userData.floor = true
-      byLine.set(l.line, floor.body)
+      for (let ln = l.line; ln <= l.endLine; ln++) byLine.set(ln, floor.body) // every line of a wrapped statement
       if (st && !byStmt.has(l.stmt)) byStmt.set(l.stmt, floor.body)
       top += FLOOR_H
-    }
+    })
     this.stmtFloors.set(f.id, byStmt)
     this.lineFloors.set(f.id, byLine)
 

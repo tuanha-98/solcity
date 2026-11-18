@@ -257,7 +257,8 @@ $('legend').innerHTML = `
   ${(['decl', 'assign', 'write', 'call', 'extcall', 'guard', 'if', 'loop', 'return', 'emit', 'revert'] as const)
     .map((k) => `<span><i style="--c:${STMT_COLORS[k]}"></i>${STMT_LABEL[k]}</span>`).join('')}
   <div class="lg-title">Buildings</div>
-  <span class="row"><b>function</b> high-rise, one storey per line, lit windows</span>
+  <span class="row"><b>function</b> high-rise, one storey per line, lit windows; long ones step back in tiers</span>
+  <span class="row"><b>inside if / for</b> storey set back like a balcony</span>
   <span class="row"><b>modifier</b> castle keep: stone storeys, turrets, flag</span>
   <span class="row"><b>interface / no body</b> glass tower · <b>_;</b> glass storey</span>
   <span class="row"><b>state variable</b> warehouse with a pitched roof</span>

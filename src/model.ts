@@ -34,12 +34,15 @@ export interface Stmt {
   reverts: string[]
 }
 
+/** One storey: a line of code, or several consecutive lines of the same statement. */
 export interface FnLine {
   line: number
-  /** offsets of the line in the source */
+  /** last line of the storey (= line unless a statement wraps over several lines) */
+  endLine: number
+  /** offsets of the storey in the source */
   start: number
   end: number
-  /** the line without comments */
+  /** the code without comments (wrapped lines joined with a space) */
   code: string
   /** index into `statements` of the innermost statement on this line, or -1 */
   stmt: number
@@ -480,13 +483,24 @@ class Ctx {
   /** The code lines between a body's braces, each tied to the innermost statement on it. */
   private bodyLines(body: AST.Block, stmts: Stmt[]): FnLine[] {
     const [open, close] = body.range ?? [0, 0]
-    return codeLines(this.src, open + 1, close, body.loc?.start.line ?? 1).map((l) => {
+    const lines = codeLines(this.src, open + 1, close, body.loc?.start.line ?? 1).map((l) => {
       let stmt = -1
       stmts.forEach((s, i) => {
         if (s.span.startLine <= l.line && l.line <= s.span.endLine && (stmt < 0 || s.depth >= stmts[stmt].depth)) stmt = i
       })
       return { ...l, stmt }
     })
+    // a statement wrapped over consecutive lines is one storey; inline assembly keeps one per line
+    const out: FnLine[] = []
+    for (const l of lines) {
+      const prev = out[out.length - 1]
+      if (prev && l.stmt >= 0 && prev.stmt === l.stmt && stmts[l.stmt].kind !== 'assembly') {
+        prev.endLine = l.line
+        prev.end = l.end
+        prev.code = `${prev.code.trim()} ${l.code.trim()}`
+      } else out.push({ ...l, endLine: l.line })
+    }
+    return out
   }
 
   /** Flatten statements depth-first. Containers (if/for/…) become one floor, children follow one level deeper. */

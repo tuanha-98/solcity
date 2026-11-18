@@ -14,7 +14,7 @@ Each contract is a **city**. Inside it, every kind of declaration has its own ar
 | Code | Building |
 |---|---|
 | `contract` / `interface` / `library` | a city: ground plate, street grid, street lights |
-| function | high-rise: plinth colour = visibility, **one storey per line of code** (blank, comment and brace-only lines skipped); glass colour = statement kind, nested `if`/`for` lines are narrower storeys; rooftop antenna |
+| function | high-rise: plinth colour = visibility, **one storey per line of code** (blank, comment and brace-only lines skipped); glass colour = statement kind; long functions step back in tiers as they rise (never wider higher up); lines inside `if` / `for` / `unchecked` blocks have their facade set back like balconies; rooftop by mutability |
 | roof (by mutability) | `payable` gilded dome · `view` glass observation deck · `pure` roof garden · state-changing plant room and antenna; read-only towers are translucent |
 | modifier | castle keep: stone storeys, corner turrets, battlements, flag; rose guard fences around the base of the towers that use it |
 | function without a body (interface, abstract) | glass tower: all facade, nothing inside |
