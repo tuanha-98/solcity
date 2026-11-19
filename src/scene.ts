@@ -4,6 +4,7 @@ import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRe
 import type { Contract, Fn, Model, NamedItem, Span, StateVar, Stmt, StmtKind } from './model'
 import { cityGate, driveCar, highway, streets, withOverpasses, type Highway, type SegKind } from './city'
 import { castle, glassStorey, glassTower, goldDome, mast, observationDeck, plantRoom, roofGarden, storey, temple, trafficCone, warehouse, type Frame, type Make, type Roof } from './architecture'
+import { LineBatch, MeshBatch, geoKey, lookKey } from './batch'
 
 // ---------------------------------------------------------------------------
 // Visual vocabulary
@@ -42,6 +43,14 @@ const LINK_COLORS = { read: '#22d3ee', write: '#fb923c', call: '#c084fc', emit: 
 const ROAD_ACCENT = { oneway: '#a78bfa', twoway: '#e2e8f0' }
 /** roads read from the chain: an address a contract holds (also its centre line), a proxy's implementation */
 const CHAIN_ACCENT = { ref: '#34d399', proxy: '#38bdf8' }
+/** scratch: the camera's view-projection, to tell whether labels need drawing again */
+const VIEW = new THREE.Matrix4()
+/** scratch: a car's place, and one of its parts' */
+const CAR = new THREE.Matrix4()
+const PART = new THREE.Matrix4()
+/** how much a highlighted storey grows, and scratch for its size */
+const GROW = new THREE.Matrix4().makeScale(1.12, 1.06, 1.12)
+const SIZE = new THREE.Vector3()
 
 // geometry constants (world units)
 const CW = 2.2 // storage cell width
@@ -146,7 +155,24 @@ export class Scene3D {
   private scene = new THREE.Scene()
   private camera: THREE.PerspectiveCamera
   private controls: OrbitControls
+  /** the city as it is built: every part a mesh of its own. Never drawn: once built, its static parts
+   * are drawn through batches and stay here as proxies (picking, positions, focus). */
   private root = new THREE.Group()
+  /** what is drawn of the city: the batches, the parts drawn as they are (roads, rings), and the
+   * highlighted storey */
+  private batches = new THREE.Group()
+  private live = new THREE.Group()
+  private overlay = new THREE.Group()
+  private meshBatches: MeshBatch[] = []
+  private lineBatches: LineBatch[] = []
+  /** batches of blinking lights, and cars: instances placed again every frame */
+  private blinkers: THREE.MeshStandardMaterial[] = []
+  private carBatches: MeshBatch[] = []
+  private carParts: { obj: THREE.Object3D; parts: { mesh: THREE.Mesh; batch: MeshBatch; slot: number }[] }[] = []
+  /** a highlighted part that is not batched, hidden while its highlighted copy shows */
+  private hiddenPart?: THREE.Mesh
+  /** the map's bounds, measured once it is built */
+  private mapBox = new THREE.Box3()
   private links = new THREE.Group()
   private sun: THREE.DirectionalLight
   private ground: THREE.Mesh
@@ -158,6 +184,14 @@ export class Scene3D {
   private fnOwner = new Map<string, string>() // fn id → contract name
   private pickables: THREE.Mesh[] = []
   private labelObjs: CSS2DObject[] = []
+  /** labels live in a scene of their own, so drawing them never walks the city's tens of thousands of objects */
+  private labelScene = new THREE.Scene()
+  private labelMode: 'all' | 'cities' | 'off' = 'all'
+  /** labels are drawn again only when they or the view changed */
+  private labelsDirty = true
+  private labelView = new THREE.Matrix4()
+  /** the map's diagonal plus a margin: how far beyond the orbit target the map can reach */
+  private mapReach = 100
   /** fn id → statement index → its first storey; fn id → source line → storey */
   private stmtFloors = new Map<string, Map<number, THREE.Mesh>>()
   private lineFloors = new Map<string, Map<number, THREE.Mesh>>()
@@ -178,7 +212,6 @@ export class Scene3D {
   private hovered?: THREE.Mesh
   private codeLabel?: CSS2DObject
   private built = false
-  private tick = 0
 
   private tween?: { target: THREE.Vector3; pos: THREE.Vector3 }
   followCamera = true
@@ -195,6 +228,8 @@ export class Scene3D {
     this.renderer.setSize(w, h)
     this.renderer.shadowMap.enabled = true
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    // the city stands still: its shadows are drawn once per build (build() asks for it), not every frame
+    this.renderer.shadowMap.autoUpdate = false
     container.append(this.renderer.domElement)
 
     this.labels = new CSS2DRenderer()
@@ -232,7 +267,7 @@ export class Scene3D {
     this.ground.rotation.x = -Math.PI / 2
     this.ground.receiveShadow = true
     this.grid = new THREE.GridHelper(1, 1, '#1b2030', '#141824')
-    this.scene.add(this.ground, this.grid, this.root, this.links)
+    this.scene.add(this.ground, this.grid, this.batches, this.live, this.overlay, this.links)
 
     new ResizeObserver(() => this.resize()).observe(container)
     this.bindPointer()
@@ -246,6 +281,7 @@ export class Scene3D {
     this.camera.updateProjectionMatrix()
     this.renderer.setSize(w, h)
     this.labels.setSize(w, h)
+    this.labelsDirty = true
   }
 
   private clock = new THREE.Clock()
@@ -265,6 +301,7 @@ export class Scene3D {
     const d = this.camera.position.distanceTo(this.controls.target)
     fog.near = d * 1.2
     fog.far = d * 3 + 60
+    this.fitClipping(d)
     for (const p of this.particles) {
       p.t = (p.t + p.speed * step) % 1
       p.mesh.position.copy(p.curve.getPointAt(p.t))
@@ -276,24 +313,68 @@ export class Scene3D {
       ;(p.mesh.material as THREE.MeshBasicMaterial).opacity = (1 - p.phase) * 0.7 * (this.dimmed(p.owner) ? 0.12 : 1)
     }
     const blink = (Math.sin(performance.now() / 260) + 1) / 2
+    for (const m of this.blinkers) m.emissiveIntensity = 0.4 + blink * 2
     for (const b of this.beacons) (b.material as THREE.MeshStandardMaterial).emissiveIntensity = 0.4 + blink * 2
-    if (++this.tick % 6 === 0) this.cullLabels()
     for (const r of this.roads.values()) for (const c of r.cars) driveCar(c, r.boost * step)
+    this.placeCars()
     this.renderer.render(this.scene, this.camera)
-    this.labels.render(this.scene, this.camera)
+    this.renderLabels()
+  }
+
+  /** Near and far planes follow the zoom: the whole map stays before the far plane, and depth
+   * precision follows the distance (a camera far away has nothing right in front of it). */
+  private fitClipping(d: number) {
+    const cam = this.camera
+    const reach = d + this.mapReach
+    const near = THREE.MathUtils.clamp(d * 0.0005, 0.1, 5)
+    if (cam.far >= reach && cam.far <= Math.max(2000, reach * 2) && Math.abs(cam.near - near) <= near * 0.25) return
+    cam.far = Math.max(2000, reach * 1.25)
+    cam.near = near
+    cam.updateProjectionMatrix()
+  }
+
+  /** Labels are drawn when they or the view changed; with labels off, not at all. */
+  private renderLabels() {
+    if (this.labelMode === 'off') return
+    const view = VIEW.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)
+    if (!this.labelsDirty && view.equals(this.labelView)) return
+    this.labelView.copy(view)
+    this.labelsDirty = false
+    this.cullLabels()
+    this.labels.render(this.labelScene, this.camera)
   }
 
   /** Small labels disappear when far away; city names and road signs always stay. */
   private cullLabels() {
     const cam = this.camera.position
-    const p = new THREE.Vector3()
     for (const l of this.labelObjs) {
       const cls = l.element.classList
-      if (cls.contains('contract') || cls.contains('road')) continue
-      l.getWorldPosition(p)
-      const far = p.distanceTo(cam) > (cls.contains('fn') ? 60 : 42)
-      cls.toggle('far', far)
+      if (!l.visible || cls.contains('contract') || cls.contains('road')) continue
+      // in the label scene, a label's position is its place in the world
+      cls.toggle('far', l.position.distanceTo(cam) > (cls.contains('fn') ? 60 : 42))
     }
+  }
+
+  /** Labels are made inside their city, which is put in place afterwards; once the map stands they
+   * move to the label scene, at the same place in the world. */
+  private adoptLabels() {
+    const p = new THREE.Vector3()
+    for (const l of this.labelObjs) {
+      l.getWorldPosition(p)
+      this.labelScene.add(l)
+      l.position.copy(p)
+    }
+    this.applyLabelMode()
+  }
+
+  /** 'cities': only city names and road signs are drawn (the rest is hidden by CSS too); 'off': none */
+  private applyLabelMode() {
+    for (const l of this.labelObjs) {
+      const cls = l.element.classList
+      l.visible = this.labelMode === 'all' || (this.labelMode === 'cities' && (cls.contains('contract') || cls.contains('road')))
+    }
+    if (this.codeLabel) this.codeLabel.visible = this.labelMode === 'all'
+    this.labelsDirty = true
   }
 
   // -------------------------------------------------------------------------
@@ -308,6 +389,9 @@ export class Scene3D {
     }
     this.layoutCities(model)
     this.fitEnvironment()
+    this.adoptLabels()
+    this.bake()
+    this.renderer.shadowMap.needsUpdate = true
     if (!this.built) this.frameAll(false)
     this.built = true
     this.focus(this.carry(this.selection))
@@ -332,11 +416,13 @@ export class Scene3D {
   private clear() {
     for (const l of this.labelObjs) l.element.remove()
     this.labelObjs = []
+    this.labelScene.clear()
     this.codeLabel?.element.remove()
     this.codeLabel = undefined
     const dispose = (o: THREE.Object3D) => {
       o.traverse((n) => {
         const m = n as THREE.Mesh
+        if ((n as THREE.InstancedMesh).isInstancedMesh) (n as THREE.InstancedMesh).dispose() // its per-instance buffers
         if (m.geometry && !m.geometry.userData.shared) m.geometry.dispose()
         const mat = m.material as THREE.Material | THREE.Material[] | undefined
         if (Array.isArray(mat)) mat.forEach((x) => x.dispose())
@@ -344,9 +430,20 @@ export class Scene3D {
       })
     }
     dispose(this.root)
+    dispose(this.live)
     dispose(this.links)
     this.root.clear()
+    this.live.clear()
     this.links.clear()
+    for (const b of [...this.meshBatches, ...this.carBatches]) b.dispose()
+    for (const b of this.lineBatches) b.dispose()
+    this.batches.clear()
+    this.meshBatches = []
+    this.lineBatches = []
+    this.carBatches = []
+    this.carParts = []
+    this.blinkers = []
+    this.clearOverlay()
     this.pickables = []
     this.stmtFloors.clear()
     this.lineFloors.clear()
@@ -363,6 +460,104 @@ export class Scene3D {
     this.byName.clear()
     this.fnOwner.clear()
     this.hovered = undefined
+  }
+
+  /**
+   * Draw the built city through batches: its static meshes by kind (same shape and look) and tile of
+   * the map, its outlines merged per tile, its cars as instances placed every frame. Roads and the
+   * rings around masts are drawn as they are. Everything stays in `root` as invisible proxies.
+   */
+  private bake() {
+    this.root.updateMatrixWorld(true)
+    const box = this.mapBox.isEmpty() ? new THREE.Box3(new THREE.Vector3(), new THREE.Vector3()) : this.mapBox
+    const size = box.getSize(new THREE.Vector3())
+    const step = Math.max(60, Math.max(size.x, size.z) / 6)
+    const tile = (e: number[]) => `${Math.floor((e[12] - box.min.x) / step)},${Math.floor((e[14] - box.min.z) / step)}`
+    const asIs = new Set<THREE.Object3D>(this.pulses.map((p) => p.mesh))
+    for (const r of this.roads.values()) asIs.add(r.group)
+    const blinking = new Set<THREE.Object3D>(this.beacons)
+    const kinds = new Map<string, { parts: THREE.Mesh[]; blink: boolean }>()
+    const outlines = new Map<string, THREE.LineSegments[]>()
+    const keep: THREE.Object3D[] = []
+    const walk = (o: THREE.Object3D) => {
+      for (const c of o.children) {
+        const m = c as THREE.Mesh
+        if (asIs.has(c)) keep.push(c)
+        else if (m.isMesh && !(m as THREE.InstancedMesh).isInstancedMesh && (m.material as THREE.Material).type === 'MeshStandardMaterial') {
+          const blink = blinking.has(m)
+          const key = `${tile(m.matrixWorld.elements)}|${geoKey(m.geometry)}|${lookKey(m.material as THREE.MeshStandardMaterial)}|${m.castShadow ? 'c' : ''}${m.receiveShadow ? 'r' : ''}${blink ? 'b' : ''}`
+          const kind = kinds.get(key)
+          if (kind) kind.parts.push(m)
+          else kinds.set(key, { parts: [m], blink })
+          walk(c)
+        } else if ((c as THREE.LineSegments).isLineSegments) {
+          const key = tile(c.matrixWorld.elements)
+          const list = outlines.get(key)
+          if (list) list.push(c as THREE.LineSegments)
+          else outlines.set(key, [c as THREE.LineSegments])
+        } else if (m.isMesh || (c as THREE.Line).isLine || (c as THREE.Points).isPoints || (c as THREE.Sprite).isSprite) keep.push(c)
+        else walk(c)
+      }
+    }
+    walk(this.root)
+    for (const o of keep) this.live.attach(o)
+    for (const { parts, blink } of kinds.values()) {
+      const b = new MeshBatch(parts, { castShadow: parts[0].castShadow, receiveShadow: parts[0].receiveShadow, blink })
+      this.meshBatches.push(b)
+      this.batches.add(b.solid, b.glass)
+      if (blink) this.blinkers.push(...b.materials)
+    }
+    for (const list of outlines.values()) {
+      const b = new LineBatch(list)
+      this.lineBatches.push(b)
+      this.batches.add(b.lines)
+    }
+    this.beacons = this.beacons.filter((b) => !b.userData.batch)
+
+    // cars: one batch per kind of part for the whole map, the car groups themselves hidden
+    const carKinds = new Map<string, THREE.Mesh[]>()
+    for (const r of this.roads.values()) for (const car of r.cars) {
+      car.obj.updateMatrixWorld(true)
+      const parts: THREE.Mesh[] = []
+      car.obj.traverse((o) => { if ((o as THREE.Mesh).isMesh) parts.push(o as THREE.Mesh) })
+      for (const p of parts) {
+        const key = `${geoKey(p.geometry)}|${lookKey(p.material as THREE.MeshStandardMaterial)}`
+        const list = carKinds.get(key)
+        if (list) list.push(p)
+        else carKinds.set(key, [p])
+      }
+      car.obj.visible = false
+      this.carParts.push({ obj: car.obj, parts: parts.map((mesh) => ({ mesh, batch: undefined as unknown as MeshBatch, slot: 0 })) })
+    }
+    for (const parts of carKinds.values()) {
+      const b = new MeshBatch(parts, { castShadow: false, receiveShadow: true, moving: true })
+      this.carBatches.push(b)
+      this.batches.add(b.solid, b.glass)
+    }
+    for (const car of this.carParts) for (const p of car.parts) {
+      p.batch = p.mesh.userData.batch as MeshBatch
+      p.slot = p.mesh.userData.slot as number
+    }
+  }
+
+  /** cars drive in their (hidden) groups; their parts' instances follow */
+  private placeCars() {
+    if (!this.carParts.length) return
+    for (const car of this.carParts) {
+      car.obj.updateMatrix()
+      CAR.multiplyMatrices(car.obj.parent!.matrixWorld, car.obj.matrix)
+      for (const p of car.parts) p.batch.solid.setMatrixAt(p.slot, PART.multiplyMatrices(CAR, p.mesh.matrix))
+    }
+    for (const b of this.carBatches) b.solid.instanceMatrix.needsUpdate = true
+  }
+
+  /** remove the highlighted copy of a storey, and show the part it stood for again */
+  private clearOverlay() {
+    for (const o of this.overlay.children) o.traverse((n) => ((n as THREE.Mesh).material as THREE.Material | undefined)?.dispose())
+    this.overlay.clear()
+    this.outline = undefined
+    if (this.hiddenPart) this.hiddenPart.visible = true
+    this.hiddenPart = undefined
   }
 
   /** One contract = one city. `left` is where the city's ground starts on the x axis. */
@@ -1205,6 +1400,7 @@ export class Scene3D {
 
   private fitEnvironment() {
     const bb = new THREE.Box3().setFromObject(this.root)
+    this.mapBox.copy(bb)
     if (bb.isEmpty()) bb.set(new THREE.Vector3(-10, 0, -10), new THREE.Vector3(10, 1, 10))
     const c = bb.getCenter(new THREE.Vector3())
     const size = bb.getSize(new THREE.Vector3())
@@ -1216,6 +1412,7 @@ export class Scene3D {
     this.grid = new THREE.GridHelper(span * 2, Math.round(span), '#1b2030', '#121620')
     this.grid.position.set(c.x, 0, c.z)
     this.scene.add(this.grid)
+    this.mapReach = Math.hypot(size.x, size.z) + 60
     const half = Math.max(size.x, size.z) / 2 + 10
     const cam = this.sun.shadow.camera
     cam.left = -half; cam.right = half; cam.top = half; cam.bottom = -half; cam.near = 1; cam.far = 200
@@ -1227,10 +1424,12 @@ export class Scene3D {
   /** all: every label · cities: only city names and road signs · off: none */
   setLabelMode(mode: 'all' | 'cities' | 'off') {
     this.labels.domElement.dataset.mode = mode
+    this.labelMode = mode
+    this.applyLabelMode()
   }
 
   frameAll(animate = true) {
-    const bb = new THREE.Box3().setFromObject(this.root)
+    const bb = this.mapBox.clone()
     if (bb.isEmpty()) return
     const c = bb.getCenter(new THREE.Vector3())
     // a steep, map-like view of the grid of cities
@@ -1331,11 +1530,7 @@ export class Scene3D {
     this.codeLabel?.element.remove()
     this.codeLabel?.removeFromParent()
     this.codeLabel = undefined
-    if (this.outline) {
-      this.outline.removeFromParent()
-      ;(this.outline.material as THREE.Material).dispose()
-      this.outline = undefined
-    }
+    this.clearOverlay()
     if (!this.model) return
 
     const active = new Set<string>()
@@ -1430,19 +1625,28 @@ export class Scene3D {
     const dim = active.size > 0
     this.dimmed = (owner) => dim && !active.has(owner)
     for (const m of this.pickables) {
-      const mat = m.material as THREE.MeshStandardMaterial
       const owners = m.userData.owners as string[]
       const isPlate = ['contract', 'road'].includes((m.userData.ref as Ref).type)
       const on = !dim || isPlate || owners.some((o) => active.has(o))
-      mat.opacity = (m.userData.baseOpacity as number) * (on ? 1 : 0.13)
+      const opacity = (m.userData.baseOpacity as number) * (on ? 1 : 0.13)
+      m.userData.opacity = opacity
+      const batch = m.userData.batch as MeshBatch | undefined
+      if (batch) {
+        batch.set(m.userData.slot as number, opacity)
+        continue
+      }
+      const mat = m.material as THREE.MeshStandardMaterial
+      mat.opacity = opacity
       mat.depthWrite = on
       mat.emissive.copy(m.userData.baseEmissive as THREE.Color)
       mat.emissiveIntensity = (m.userData.baseEI as number) ?? 1
-      m.scale.copy(m.userData.baseScale ?? m.scale)
     }
     for (const fr of this.frames) {
       const on = !dim || fr.owners.some((o) => active.has(o))
-      ;(fr.obj.material as THREE.LineBasicMaterial).opacity = (fr.obj.userData.baseOpacity as number) * (on ? 1 : 0.12)
+      const opacity = (fr.obj.userData.baseOpacity as number) * (on ? 1 : 0.12)
+      const batch = fr.obj.userData.lineBatch as LineBatch | undefined
+      if (batch) batch.set(fr.obj, opacity)
+      else (fr.obj.material as THREE.LineBasicMaterial).opacity = opacity
     }
     for (const l of this.labelObjs) {
       const o = l.element.dataset.owner
@@ -1471,26 +1675,43 @@ export class Scene3D {
     }
 
     if (highlight) {
-      const mat = highlight.material as THREE.MeshStandardMaterial
+      // a lit copy of the storey, a little larger, drawn instead of the storey itself
+      const mat = (highlight.material as THREE.MeshStandardMaterial).clone()
       mat.emissive.set('#ffffff')
       mat.emissiveIntensity = mat.emissiveMap ? 1.4 : 0.45
-      mat.opacity = Math.max(mat.opacity, 0.85)
-      if (!highlight.userData.baseScale) highlight.userData.baseScale = highlight.scale.clone()
-      highlight.scale.copy((highlight.userData.baseScale as THREE.Vector3).clone().multiply(new THREE.Vector3(1.12, 1.06, 1.12)))
+      mat.opacity = Math.max(highlight.userData.baseOpacity as number, 0.85)
+      mat.transparent = mat.opacity < 1
+      mat.depthWrite = true
+      const lit = new THREE.Mesh(highlight.geometry, mat)
+      lit.matrixAutoUpdate = false
+      highlight.updateWorldMatrix(true, false)
+      lit.matrix.copy(highlight.matrixWorld).multiply(GROW)
+      this.overlay.add(lit)
+      const batch = highlight.userData.batch as MeshBatch | undefined
+      if (batch) batch.set(highlight.userData.slot as number, 0)
+      else {
+        highlight.visible = false
+        this.hiddenPart = highlight
+      }
       // bright frame around the storey
       this.outline = new THREE.LineSegments(unitEdges, new THREE.LineBasicMaterial({ color: '#ffffff' }))
       this.outline.scale.setScalar(1.03)
-      highlight.add(this.outline)
+      lit.add(this.outline)
       const ref = highlight.userData.ref as Ref
       const div = document.createElement('div')
       div.className = 'lbl code'
       div.textContent = ref.detail
       this.codeLabel = new CSS2DObject(div)
       this.codeLabel.center.set(0, 0.5)
-      this.codeLabel.position.set(highlight.scale.x / 2 + 0.4, 0, 0)
-      this.codeLabel.position.divide(highlight.scale) // child of a scaled mesh
-      highlight.add(this.codeLabel)
+      // beside the storey: its place in the world, in the label scene
+      const w = SIZE.setFromMatrixScale(lit.matrix).x
+      this.codeLabel.position.set((w / 2 + 0.4) / w, 0, 0).applyMatrix4(lit.matrix)
+      this.codeLabel.visible = this.labelMode === 'all'
+      this.labelScene.add(this.codeLabel)
+      this.labelsDirty = true
     }
+    for (const b of this.meshBatches) b.commit()
+    for (const b of this.lineBatches) b.commit()
 
     if (this.followCamera) {
       const pts = fitIds?.map((id) => this.anchors.get(id)).filter((p): p is THREE.Vector3 => !!p)
@@ -1512,7 +1733,7 @@ export class Scene3D {
       ray.setFromCamera(ndc, this.camera)
       const hits = ray.intersectObjects(this.pickables, false)
       // prefer things that are not faded out, and anything over the plate
-      const visible = hits.filter((h) => ((h.object as THREE.Mesh).material as THREE.Material).opacity > 0.2)
+      const visible = hits.filter((h) => ((h.object.userData.opacity as number | undefined) ?? ((h.object as THREE.Mesh).material as THREE.Material).opacity) > 0.2)
       const best = visible.find((h) => (h.object.userData.ref as Ref).type !== 'contract') ?? visible[0]
       return best?.object as THREE.Mesh | undefined
     }

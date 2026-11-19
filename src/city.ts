@@ -123,7 +123,11 @@ const CAR_COLORS = ['#f43f5e', '#f59e0b', '#22d3ee', '#a3e635', '#e879f9', '#f8f
 
 function curveOf(pts: THREE.Vector3[]) {
   const c = new THREE.CurvePath<THREE.Vector3>()
-  for (let i = 0; i < pts.length - 1; i++) c.add(new THREE.LineCurve3(pts[i], pts[i + 1]))
+  for (let i = 0; i < pts.length - 1; i++) {
+    const piece = new THREE.LineCurve3(pts[i], pts[i + 1])
+    piece.arcLengthDivisions = 1 // straight: its length is the distance between its ends (not 200 samples)
+    c.add(piece)
+  }
   return c
 }
 
@@ -146,7 +150,7 @@ function car(color: string) {
     t.position.set(-0.42, 0.22, s * 0.14)
     g.add(h, t)
   }
-  body.castShadow = cabin.castShadow = true
+  // no shadow: the shadow map is drawn once per build, and a moving car would leave its shadow behind
   g.add(body, cabin)
   return g
 }
@@ -197,11 +201,15 @@ function smoothRoad(route: THREE.Vector3[], radius: number, step = 0.18): Sample
   for (let i = 0; i < path.length - 1; i++) {
     const a = path[i], u = dir(i), L = d[i + 1] - d[i]
     const s0 = r[i], s1 = L - r[i + 1]
-    const n = Math.max(1, Math.ceil((s1 - s0) / step))
-    for (let k = 0; k <= n; k++) {
-      if (k === 0 && pts.length) continue
-      const s = s0 + ((s1 - s0) * k) / n
-      pts.push({ x: a.x + u.x * s, z: a.z + u.z * s, dist: d[i] + s })
+    const at = (s: number) => ({ x: a.x + u.x * s, z: a.z + u.z * s, dist: d[i] + s })
+    // a straight leg is cut at the route's points on it; a level piece needs no samples between its
+    // ends, a ramp (eased) one every `step`
+    const cuts = [s0, ...rd.map((x) => x - d[i]).filter((s) => s > s0 + 1e-6 && s < s1 - 1e-6), s1]
+    if (!pts.length) pts.push(at(s0))
+    for (let k = 1; k < cuts.length; k++) {
+      const p = cuts[k - 1], q = cuts[k]
+      const n = Math.abs(yAt(d[i] + p) - yAt(d[i] + q)) < 1e-6 ? 1 : Math.max(1, Math.ceil((q - p) / step))
+      for (let j = 1; j <= n; j++) pts.push(at(p + ((q - p) * j) / n))
     }
     if (r[i + 1] > 0) {
       // rounded corner: a true circular arc, so every line offset from the centre (edges, lanes,
@@ -265,6 +273,33 @@ function band(parent: THREE.Object3D, S: Sample[], off: number, w: number, lift:
   return m
 }
 
+/** the road at distance `s`, between samples A and B */
+function between(A: Sample, B: Sample, s: number): Sample {
+  const t = B.s > A.s ? (s - A.s) / (B.s - A.s) : 0
+  return { p: A.p.clone().lerp(B.p, t), n: A.n.clone().lerp(B.n, t).normalize(), s }
+}
+
+/** the samples with one more at each of the distances `cuts` (ascending): where dashes start and end */
+function withCuts(S: Sample[], cuts: number[]): Sample[] {
+  const out: Sample[] = [S[0]]
+  let k = 0
+  for (let i = 1; i < S.length; i++) {
+    const A = S[i - 1], B = S[i]
+    while (k < cuts.length && cuts[k] <= A.s + 1e-6) k++
+    for (; k < cuts.length && cuts[k] < B.s - 1e-6; k++) out.push(between(A, B, cuts[k]))
+    out.push(B)
+  }
+  return out
+}
+
+/** the same mesh at every transform, in one draw call */
+function instances(geo: THREE.BufferGeometry, material: THREE.Material, at: THREE.Matrix4[]) {
+  const m = new THREE.InstancedMesh(geo, material, at.length)
+  at.forEach((x, i) => m.setMatrixAt(i, x))
+  m.receiveShadow = true
+  return m
+}
+
 /**
  * A road along an axis-aligned route.
  * one-way: single lane, chevrons and cars all heading from path start to end.
@@ -294,8 +329,12 @@ export function highway(path: THREE.Vector3[], kind: 'oneway' | 'twoway', traffi
   if (kind === 'twoway') {
     const centre = line ? mat(line, { emissive: line, emissiveIntensity: 0.4, side: DS }) : mat('#facc15', { emissive: '#a16207', emissiveIntensity: 0.5, side: DS })
     paint.push(centre)
-    band(group, S, 0, 0.08, 0.036, centre, { keep: (i) => S[i].s % 1.0 < 0.55 })
-    const lanes = [lane(0.62), lane(-0.62).reverse()]
+    // dashes 0.55 long, one every 1: the samples get a cut where each dash starts and ends
+    const cuts: number[] = []
+    for (let s = 0; s < S[S.length - 1].s; s += 1) cuts.push(s, s + 0.55)
+    const D = withCuts(S, cuts)
+    band(group, D, 0, 0.08, 0.036, centre, { keep: (i) => ((D[i].s + D[i + 1].s) / 2) % 1 < 0.55 })
+    const lanes = [curveOf(lane(0.62)), curveOf(lane(-0.62).reverse())]
     const n = Math.min(Math.max(traffic, 1) * 2, 10)
     for (let i = 0; i < n; i++) cars.push(spawn(group, lanes[i % 2], i, n))
   } else {
@@ -305,37 +344,43 @@ export function highway(path: THREE.Vector3[], kind: 'oneway' | 'twoway', traffi
     const shape = new THREE.Shape([new THREE.Vector2(-0.25, -0.35), new THREE.Vector2(0.15, 0), new THREE.Vector2(-0.25, 0.35), new THREE.Vector2(-0.05, 0)])
     const geo = new THREE.ShapeGeometry(shape)
     geo.rotateX(-Math.PI / 2)
+    const at: THREE.Matrix4[] = []
+    const up = new THREE.Vector3(0, 1, 0), one = new THREE.Vector3(1, 1, 1)
     let next = 1.6
-    for (let i = 1; i < S.length - 1; i++) {
-      if (S[i].s < next) continue
-      const level = Math.abs(S[i + 1].p.y - S[i - 1].p.y) < 0.01
-      const straight = S[i - 1].n.dot(S[i + 1].n) > 0.999
-      if (!level || !straight) continue
-      const m = new THREE.Mesh(geo, chev)
-      m.position.copy(S[i].p).setY(S[i].p.y + 0.038)
-      m.rotation.y = Math.atan2(S[i].n.x, S[i].n.z) // shape points +x; this turns +x onto the travel direction
-      group.add(m)
-      next = S[i].s + 2.6
+    for (let i = 0; i < S.length - 1; i++) {
+      const A = S[i], B = S[i + 1]
+      if (Math.abs(A.p.y - B.p.y) > 0.01 || A.n.dot(B.n) < 0.999) continue // ramps and bends
+      for (let s = Math.max(next, A.s + 0.4); s <= B.s - 0.4; s += 2.6) {
+        const { p, n } = between(A, B, s)
+        // the shape points +x; this turns +x onto the travel direction
+        const q = new THREE.Quaternion().setFromAxisAngle(up, Math.atan2(n.x, n.z))
+        at.push(new THREE.Matrix4().compose(p.setY(p.y + 0.038), q, one))
+        next = s + 2.6
+      }
     }
+    if (at.length) group.add(instances(geo, chev, at))
+    const way = curveOf(lane(0))
     const n = Math.min(Math.max(traffic, 3), 6)
-    for (let i = 0; i < n; i++) cars.push(spawn(group, lane(0), i, n))
+    for (let i = 0; i < n; i++) cars.push(spawn(group, way, i, n))
   }
 
   // overpass furniture: guard rails and their posts (the deck needs no pillars)
   const railMat = mat('#a3adc2', { metalness: 0.5, roughness: 0.35, side: DS })
   for (const side of [-1, 1]) band(group, S, side * (width / 2 + 0.06), 0.07, 0.3, railMat, { depth: () => 0.07, keep: raised })
+  const posts: THREE.Matrix4[] = []
+  const postSize = new THREE.Vector3(0.05, 0.26, 0.05), still = new THREE.Quaternion()
   let nextPost = 0
   for (let i = 0; i < S.length - 1; i++) {
-    const { p, n, s } = S[i]
-    if (!raised(i) || s < nextPost) continue
-    for (const side of [-1, 1]) {
-      const post = new THREE.Mesh(box, railMat)
-      post.scale.set(0.05, 0.26, 0.05)
-      post.position.copy(p).addScaledVector(n, side * (width / 2 + 0.06)).setY(p.y + 0.16)
-      group.add(post)
+    if (!raised(i)) continue
+    for (let s = Math.max(nextPost, S[i].s); s < S[i + 1].s; s += 0.9) {
+      const { p, n } = between(S[i], S[i + 1], s)
+      for (const side of [-1, 1]) {
+        posts.push(new THREE.Matrix4().compose(p.clone().addScaledVector(n, side * (width / 2 + 0.06)).setY(p.y + 0.16), still, postSize))
+      }
+      nextPost = s + 0.9
     }
-    nextPost = s + 0.9
   }
+  if (posts.length) group.add(instances(box, railMat, posts))
 
   // label over the middle of the longest straight leg of the route
   let best = 0, labelPos = path[0].clone()
@@ -347,9 +392,9 @@ export function highway(path: THREE.Vector3[], kind: 'oneway' | 'twoway', traffi
   return { group, asphalt, paint, paintColor, cars, labelPos }
 }
 
-function spawn(group: THREE.Group, lane: THREE.Vector3[], i: number, n: number): Car {
-  const curve = curveOf(lane)
-  const c = car(CAR_COLORS[(i * 3 + lane.length) % CAR_COLORS.length])
+/** a car on a lane (the cars of a lane share its curve) */
+function spawn(group: THREE.Group, curve: THREE.CurvePath<THREE.Vector3>, i: number, n: number): Car {
+  const c = car(CAR_COLORS[(i * 3 + curve.curves.length + 1) % CAR_COLORS.length])
   c.rotation.order = 'YZX' // yaw, then pitch on ramps
   group.add(c)
   const len = curve.getLength()

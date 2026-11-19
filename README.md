@@ -122,6 +122,8 @@ Vyper contracts are skipped.
 - `src/model.ts`: parse (`@solidity-parser/parser`) → contracts, storage layout, statements, reads/writes
 - `src/scene.ts`: three.js scene, city layout, highway routing, links, focus, picking
 - `src/architecture.ts`: building styles; `src/city.ts`: streets, lights, highways, cars
+- `src/batch.ts`: draws a built city in few draw calls (instanced batches per kind of part and map
+  tile, opacity and glow per instance; the parts stay as invisible proxies for picking and focus)
 - `src/github.ts`: GitHub links, repo listing, import flattening
 - `src/onchain.ts`: import from an address (verified source, proxies, related contracts, chain reads);
   `src/keccak.ts`: Keccak-256 for selectors, storage slots and checksums
