@@ -18,6 +18,8 @@ export interface Chain {
   blockscout?: string
   /** explorer hosts whose links point at this chain */
   hosts: string[]
+  /** not built in: found from a link to its Blockscout explorer */
+  custom?: boolean
 }
 
 export const CHAINS: Chain[] = [
@@ -41,8 +43,17 @@ export const shortAddress = (a: string) => {
   return `${c.slice(0, 6)}…${c.slice(-4)}`
 }
 
+export interface Target {
+  chainId: number
+  address: string
+  /** the input names the chain: a known explorer's link, a Sourcify link or eip155:… */
+  chainFromLink: boolean
+  /** the origin of a link to an explorer solcity does not know yet, to ask it which chain it shows */
+  explorer?: string
+}
+
 /** An address (on `fallbackChain`), an explorer link (etherscan.io/address/0x…, basescan.org/token/0x…), or eip155:<chain>:<address>. */
-export function parseTarget(input: string, fallbackChain: number): { chainId: number; address: string; chainFromLink: boolean } {
+export function parseTarget(input: string, fallbackChain: number): Target {
   const s = input.trim()
   const caip = /^eip155:(\d+):(0x[0-9a-fA-F]{40})$/i.exec(s)
   if (caip) return { chainId: Number(caip[1]), address: caip[2].toLowerCase(), chainFromLink: true }
@@ -60,7 +71,61 @@ export function parseTarget(input: string, fallbackChain: number): { chainId: nu
   // Sourcify links name the chain by its id: repo.sourcify.dev/1/0x…
   const sourcify = /(^|\.)sourcify\.dev$/.test(host) ? /\/(\d+)\/0x[0-9a-fA-F]{40}/.exec(url.pathname + url.hash) : null
   const chainId = chain?.id ?? (sourcify ? Number(sourcify[1]) : fallbackChain)
-  return { chainId, address: m[0].toLowerCase(), chainFromLink: !!chain || !!sourcify }
+  return { chainId, address: m[0].toLowerCase(), chainFromLink: !!chain || !!sourcify, explorer: chain || sourcify ? undefined : url.origin }
+}
+
+// ---------------------------------------------------------------------------
+// explorers solcity does not know
+
+/** a Blockscout explorer found from a pasted link (the page keeps these and adds them back at start) */
+export interface Explorer {
+  origin: string
+  chainId: number
+  name: string
+}
+
+const hostOf = (origin: string) => new URL(origin).hostname.replace(/^www\./, '')
+
+/** Point an explorer's links at its chain and read code from it: a chain solcity did not know is added
+ * (and read through the explorer's own JSON-RPC); a known chain without a Blockscout gets this one. */
+export function addExplorer(e: Explorer): Chain {
+  let chain = CHAINS.find((c) => c.id === e.chainId)
+  if (!chain) {
+    chain = { id: e.chainId, name: e.name, rpc: `${e.origin}/api/eth-rpc`, hosts: [], custom: true }
+    CHAINS.push(chain)
+  }
+  chain.blockscout ??= e.origin
+  const host = hostOf(e.origin)
+  if (!chain.hosts.includes(host)) chain.hosts.push(host)
+  return chain
+}
+
+/** Which chain an explorer solcity does not know shows. A Blockscout explorer answers JSON-RPC at
+ * /api/eth-rpc, to browsers too; the chain's name comes from Sourcify's list of chains, then from
+ * Blockscout's, else it is the explorer's host. */
+export async function probeExplorer(origin: string): Promise<Explorer> {
+  const host = hostOf(origin)
+  let id = 0
+  try {
+    const [r] = await rpc(`${origin}/api/eth-rpc`, [{ method: 'eth_chainId', params: [] }])
+    if (r && /^0x[0-9a-f]+$/i.test(r)) id = parseInt(r, 16)
+  } catch { /* no answer: not a Blockscout explorer */ }
+  if (!id) throw new Error(`${host} did not answer like a Blockscout explorer, so solcity cannot tell which chain it shows. If the chain is in the list, pick it and paste the bare address.`)
+  return { origin, chainId: id, name: CHAINS.find((c) => c.id === id)?.name ?? (await chainName(id)) ?? host }
+}
+
+async function chainName(id: number): Promise<string | undefined> {
+  const lists: [string, (body: unknown) => unknown][] = [
+    ['https://sourcify.dev/server/chains', (b) => Array.isArray(b) ? (b as { chainId?: number; name?: unknown }[]).find((c) => c.chainId === id)?.name : undefined],
+    ['https://chains.blockscout.com/api/chains', (b) => (b as Record<string, { name?: unknown } | undefined>)?.[String(id)]?.name],
+  ]
+  for (const [url, pick] of lists) {
+    try {
+      const name = pick((await getJson<unknown>(url)).body)
+      if (typeof name === 'string' && name.trim()) return name.replace(/\s+/g, ' ').trim().slice(0, 40)
+    } catch { /* the next list */ }
+  }
+  return undefined
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +346,21 @@ function literalAddresses(text: string): { via: string; address: string }[] {
   return [...out].map(([address, via]) => ({ address, via }))
 }
 
-const isContractCode = (code?: string) => !!code && code !== '0x' && !/^0xef0100/i.test(code) // EIP-7702 accounts are not contracts
+const isContractCode = (code?: string): code is string => !!code && code !== '0x' && !/^0xef0100/i.test(code) // EIP-7702 accounts are not contracts
+
+/** Whether code runs DELEGATECALL (or the old CALLCODE), as every proxy does. PUSH data and the
+ * compiler's metadata at the end are skipped. */
+function delegates(code: string): boolean {
+  let hex = code.slice(2).toLowerCase()
+  const meta = (parseInt(hex.slice(-4), 16) + 2) * 2
+  if (meta < hex.length && /^a[1-5]6[45]/.test(hex.slice(hex.length - meta))) hex = hex.slice(0, hex.length - meta)
+  for (let i = 0; i < hex.length; i += 2) {
+    const op = parseInt(hex.slice(i, i + 2), 16)
+    if (op === 0xf4 || op === 0xf2) return true
+    if (op >= 0x60 && op <= 0x7f) i += (op - 0x5f) * 2
+  }
+  return false
+}
 
 // ---------------------------------------------------------------------------
 // one Solidity text
@@ -542,24 +621,32 @@ export async function importFromChain(o: ImportOptions): Promise<ImportResult> {
     const hops = n.depth < o.depth
     if (!n.impl) {
       await codeOf([n.address])
-      if (!isContractCode(codes.get(n.address))) {
+      const code = codes.get(n.address)
+      if (!isContractCode(code)) {
         warn(`${shortAddress(n.address)} has no contract code on ${o.chain.name}`)
         return
       }
-      const S = SLOTS()
-      const words = await rpc(rpcUrl, [...S.impl, S.beacon, ...S.admin].map((s) => ({ method: 'eth_getStorageAt', params: [n.address, s, 'latest'] })))
-      const impls = new Set(n.v?.implementations ?? [])
-      const minimal = MINIMAL_PROXY.exec(codes.get(n.address) ?? '')
-      if (minimal) impls.add(`0x${minimal[1].toLowerCase()}`)
-      for (const w of words.slice(0, S.impl.length)) { const a = wordAddress(w); if (a) impls.add(a) }
-      const beacon = wordAddress(words[S.impl.length])
-      if (beacon) {
-        const [r] = await rpc(rpcUrl, [{ method: 'eth_call', params: [{ to: beacon, data: selector('implementation()') }, 'latest'] }])
-        const a = wordAddress(r)
-        if (a) impls.add(a)
-        if (hops) refs.push({ via: 'beacon', address: beacon })
+      const impls = new Set<string>()
+      // only code that delegates can be a proxy (explorers also take a contract with an implementation()
+      // getter for one: a factory of clones, say)
+      if (delegates(code)) {
+        const S = SLOTS()
+        const words = await rpc(rpcUrl, [...S.impl, S.beacon, ...S.admin].map((s) => ({ method: 'eth_getStorageAt', params: [n.address, s, 'latest'] })))
+        for (const a of n.v?.implementations ?? []) impls.add(a)
+        const minimal = MINIMAL_PROXY.exec(code)
+        if (minimal) impls.add(`0x${minimal[1].toLowerCase()}`)
+        for (const w of words.slice(0, S.impl.length)) { const a = wordAddress(w); if (a) impls.add(a) }
+        const beacon = wordAddress(words[S.impl.length])
+        if (beacon) {
+          const [r] = await rpc(rpcUrl, [{ method: 'eth_call', params: [{ to: beacon, data: selector('implementation()') }, 'latest'] }])
+          const a = wordAddress(r)
+          if (a) impls.add(a)
+          if (hops) refs.push({ via: 'beacon', address: beacon })
+        }
+        for (const w of words.slice(S.impl.length + 1)) { const a = wordAddress(w); if (a && hops) refs.push({ via: 'admin', address: a }) }
+      } else if (n.v?.implementations.length) {
+        say(`${label(n)}: ${n.v.provider} lists it as a proxy, but its code never delegates; read as a contract`)
       }
-      for (const w of words.slice(S.impl.length + 1)) { const a = wordAddress(w); if (a && hops) refs.push({ via: 'admin', address: a }) }
       impls.delete(n.address)
       for (const a of impls) {
         n.proxy = true

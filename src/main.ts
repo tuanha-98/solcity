@@ -4,7 +4,7 @@ import { analyze, itemsAtLine, type Model, type Span } from './model'
 import { Scene3D, STMT_COLORS, STMT_LABEL, type Ref } from './scene'
 import { SAMPLE, OLD_SAMPLE_HASHES, hashText } from './sample'
 import { defaultBranch, fetchRaw, flatten, listSolidity, parseGitHubUrl, type RepoRef } from './github'
-import { CHAINS, importFromChain, parseTarget } from './onchain'
+import { CHAINS, addExplorer, importFromChain, parseTarget, probeExplorer, type Chain, type Explorer, type Target } from './onchain'
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T
 const store = {
@@ -223,7 +223,28 @@ const ad = {
   status: $('addr-status'),
   log: $<HTMLUListElement>('addr-log'),
 }
-ad.chain.innerHTML = CHAINS.map((c) => `<option value="${c.id}">${c.name}</option>`).join('')
+// Blockscout explorers of chains found from pasted links, kept in this browser
+const explorers: Explorer[] = (() => {
+  try {
+    const list = JSON.parse(store.get('solcity:explorers') ?? '[]') as Partial<Explorer>[]
+    return list.filter((e): e is Explorer => typeof e?.origin === 'string' && /^https?:\/\/[^/]+$/.test(e.origin)
+      && Number.isSafeInteger(e.chainId) && e.chainId! > 0 && typeof e.name === 'string')
+  } catch {
+    return []
+  }
+})()
+explorers.forEach(addExplorer)
+/** the chain list: the built-in chains, then the ones found from explorer links */
+const fillChains = () => {
+  const was = ad.chain.value
+  const opt = (c: Chain) => new Option(c.name, String(c.id))
+  const found = document.createElement('optgroup')
+  found.label = 'From explorer links'
+  found.append(...CHAINS.filter((c) => c.custom).map(opt))
+  ad.chain.replaceChildren(...CHAINS.filter((c) => !c.custom).map(opt), ...(found.childElementCount ? [found] : []))
+  if (was) ad.chain.value = was
+}
+fillChains()
 ad.chain.value = store.get('solcity:chain') ?? '1'
 if (!ad.chain.value) ad.chain.value = '1'
 ad.depth.value = store.get('solcity:depth') ?? '1'
@@ -247,12 +268,57 @@ $('address').addEventListener('click', () => {
 })
 $('addr-close').addEventListener('click', () => ad.dlg.close())
 ad.chain.addEventListener('change', () => (ad.rpc.value = store.get(rpcKey()) ?? ''))
+/** select a chain, with the RPC node kept for it */
+const pickChain = (id: number) => {
+  if (ad.chain.value === String(id)) return
+  ad.chain.value = String(id)
+  ad.rpc.value = store.get(rpcKey()) ?? ''
+}
+
+const probes = new Map<string, Promise<Chain>>()
+/** the chain an explorer solcity does not know shows: asked once, then kept in this browser */
+function explorerChain(origin: string): Promise<Chain> {
+  let p = probes.get(origin)
+  if (!p) {
+    p = probeExplorer(origin).then((e) => {
+      const chain = addExplorer(e)
+      if (!explorers.some((x) => x.origin === e.origin)) {
+        explorers.push(e)
+        store.set('solcity:explorers', JSON.stringify(explorers))
+      }
+      fillChains()
+      return chain
+    })
+    p.catch(() => probes.delete(origin)) // asked again next time
+    probes.set(origin, p)
+  }
+  return p
+}
+const asking = (origin: string) => adSay(`Asking ${new URL(origin).host} which chain it shows…`)
+
 // an explorer link names its chain: pick it as soon as one is pasted
 ad.input.addEventListener('input', () => {
+  let t: Target
   try {
-    const t = parseTarget(ad.input.value, Number(ad.chain.value))
-    if (t.chainFromLink && CHAINS.some((c) => c.id === t.chainId)) ad.chain.value = String(t.chainId)
-  } catch { /* not a whole address yet */ }
+    t = parseTarget(ad.input.value, Number(ad.chain.value))
+  } catch {
+    return // not a whole address yet
+  }
+  adSay('')
+  if (t.chainFromLink && CHAINS.some((c) => c.id === t.chainId)) pickChain(t.chainId)
+  const origin = t.explorer
+  if (!origin) return
+  const host = new URL(origin).host
+  const still = () => ad.input.value.toLowerCase().includes(host) // the answer is for what is in the box
+  asking(origin)
+  explorerChain(origin).then(
+    (c) => {
+      if (!still()) return
+      pickChain(c.id)
+      adSay(`${host}: Blockscout explorer of ${c.name} (chain ${c.id})`)
+    },
+    (err: Error) => { if (still()) adSay(err.message, true) },
+  )
 })
 ad.form.addEventListener('submit', async (e) => {
   e.preventDefault()
@@ -260,9 +326,10 @@ ad.form.addEventListener('submit', async (e) => {
   ad.log.replaceChildren()
   try {
     const t = parseTarget(ad.input.value, Number(ad.chain.value))
-    const chain = CHAINS.find((c) => c.id === t.chainId)
+    if (t.explorer) asking(t.explorer)
+    const chain = t.explorer ? await explorerChain(t.explorer) : CHAINS.find((c) => c.id === t.chainId)
     if (!chain) throw new Error(`Chain ${t.chainId} is not one solcity knows; pick a chain from the list and paste the bare address`)
-    ad.chain.value = String(chain.id)
+    pickChain(chain.id)
     store.set('solcity:addr', ad.input.value.trim())
     store.set('solcity:chain', String(chain.id))
     store.set('solcity:depth', ad.depth.value)

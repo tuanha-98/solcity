@@ -58,7 +58,7 @@
     <dialog id="addr">
       <form id="addr-form">
         <h3>Import from an address</h3>
-        <p class="muted">Paste a contract address or an explorer link (Etherscan, Basescan, Blockscout…). Its verified code is loaded, with the implementation if it is a proxy, and the contracts it points to (<code>factory()</code>, <code>token0()</code>, <code>owner()</code>… read from the chain) come along as cities joined by on-chain roads.</p>
+        <p class="muted">Paste a contract address or an explorer link (Etherscan, Basescan, any Blockscout explorer…). Its verified code is loaded, with the implementation if it is a proxy, and the contracts it points to (<code>factory()</code>, <code>token0()</code>, <code>owner()</code>… read from the chain) come along as cities joined by on-chain roads.</p>
         <div class="gh-row">
           <select id="addr-chain" title="Chain (a link picks it for you)"></select>
           <input id="addr-input" placeholder="0x… or https://etherscan.io/address/0x…" spellcheck="false" autocomplete="off" />
@@ -78,7 +78,7 @@
           <summary>Etherscan key and RPC node (optional)</summary>
           <p class="muted">Sourcify and Blockscout need no key. An Etherscan API key adds contracts verified only on Etherscan; it is kept in this browser and sent to Etherscan only.</p>
           <input id="addr-key" type="password" placeholder="Etherscan API key" spellcheck="false" autocomplete="off" />
-          <input id="addr-rpc" placeholder="JSON-RPC URL (default: a public node of the chain)" spellcheck="false" autocomplete="off" />
+          <input id="addr-rpc" placeholder="JSON-RPC URL (default: a public node of the chain, or its explorer's)" spellcheck="false" autocomplete="off" />
         </details>
         <div id="addr-status" class="gh-status"></div>
         <ul id="addr-log"></ul>

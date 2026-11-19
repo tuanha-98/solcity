@@ -81,12 +81,17 @@ Files come from `raw.githubusercontent.com`; listing a repo uses the GitHub API,
 **Address** in the toolbar takes a contract address and a chain, or an explorer link that names the chain
 (`etherscan.io/address/0x…`, `basescan.org/token/0x…`, a Blockscout link, or `eip155:<chain>:0x…`).
 Ethereum, Base, Arbitrum, OP, Polygon, BNB Chain, Avalanche, Gnosis, Linea, Scroll, Unichain, Sepolia and
-Base Sepolia are listed.
+Base Sepolia are listed. A link from any other Blockscout explorer works too
+(`explorer.risechain.com/address/0x…`): solcity asks the explorer which chain it shows (its `/api/eth-rpc`),
+then reads the code from that explorer and the chain through it. The chain is added to the list, under
+*From explorer links*, in this browser.
 
 1. The verified source of the address comes from Sourcify, then Blockscout (neither needs a key), then
    Etherscan if you add your own API key. Its files are joined into one, imports commented out.
 2. If it is a proxy (EIP-1967, EIP-1822, ZeppelinOS, beacon, EIP-1167 clone, or what the explorer
-   reports), its implementation is loaded too and joined by a proxy road.
+   reports), its implementation is loaded too and joined by a proxy road. Only code that runs
+   DELEGATECALL counts as a proxy: explorers also call a contract with an `implementation()` getter one,
+   such as a factory of clones.
 3. **Follow** reads what it points to from the chain: every view function without arguments that
    returns an address (`factory()`, `token0()`, `owner()`…, called on the proxy for an implementation),
    the EIP-1967 admin and beacon, and addresses written in its code. Each one that is a contract joins
